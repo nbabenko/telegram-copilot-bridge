@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,6 +39,7 @@ COPILOT_BIN = os.environ.get("COPILOT_BIN", "/usr/bin/copilot")
 COPILOT_TIMEOUT = int(os.environ.get("COPILOT_TIMEOUT", "1200"))
 TELEGRAM_TIMEOUT = int(os.environ.get("TELEGRAM_TIMEOUT", "30"))
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@").lower()
 
 
 def telegram_request(method: str, payload: dict | None = None) -> dict:
@@ -62,6 +64,17 @@ def send_typing(chat_id: int) -> None:
     telegram_request("sendChatAction", {"chat_id": str(chat_id), "action": "typing"})
 
 
+def resolve_bot_username() -> str:
+    result = telegram_request("getMe")
+    if not result.get("ok"):
+        raise RuntimeError("Unable to resolve Telegram bot username")
+    return str(result["result"].get("username", "")).strip().lstrip("@").lower()
+
+
+if not BOT_USERNAME:
+    BOT_USERNAME = resolve_bot_username()
+
+
 def split_message(text: str, max_len: int = 3500) -> list[str]:
     chunks: list[str] = []
     remaining = text.strip()
@@ -82,6 +95,52 @@ def split_message(text: str, max_len: int = 3500) -> list[str]:
 def send_text_blocks(chat_id: int, text: str, reply_to_message_id: int | None = None) -> None:
     for chunk in split_message(text):
         send_message(chat_id, chunk, reply_to_message_id)
+
+
+def normalize_command_token(token: str) -> str:
+    if not token.startswith("/"):
+        return token
+    if "@" not in token:
+        return token
+    command, _, target = token.partition("@")
+    if not BOT_USERNAME or target.lower() != BOT_USERNAME:
+        return ""
+    return command
+
+
+def is_reply_to_bot(message: dict) -> bool:
+    reply = message.get("reply_to_message") or {}
+    from_user = reply.get("from") or {}
+    username = str(from_user.get("username", "")).strip().lstrip("@").lower()
+    return bool(from_user.get("is_bot") and BOT_USERNAME and username == BOT_USERNAME)
+
+
+def message_mentions_bot(message: dict, text: str) -> bool:
+    if not BOT_USERNAME:
+        return False
+    for entity in message.get("entities", []):
+        if entity.get("type") != "mention":
+            continue
+        offset = entity.get("offset", 0)
+        length = entity.get("length", 0)
+        mention = text[offset:offset + length].strip().lstrip("@").lower()
+        if mention == BOT_USERNAME:
+            return True
+    return False
+
+
+def should_handle_message(message: dict, user_id: int, text: str) -> bool:
+    chat_type = (message.get("chat") or {}).get("type", "private")
+    if chat_type == "private":
+        return True
+    if user_id not in ALLOWED_USER_IDS:
+        return False
+    command = text.strip().split()[0] if text.strip().startswith("/") else ""
+    if command and normalize_command_token(command):
+        return True
+    if is_reply_to_bot(message):
+        return True
+    return message_mentions_bot(message, text)
 
 
 def load_state() -> dict:
@@ -124,7 +183,9 @@ def help_text() -> str:
         "/status - show bridge status\n"
         "/copilot <prompt> - send a prompt immediately\n\n"
         "Any plain text message is sent to Copilot in the configured repository.\n"
-        "Telegram receives the full raw Copilot CLI output, not only the final summary."
+        "Telegram receives the full raw Copilot CLI output, not only the final summary.\n\n"
+        "In group chats, the bot responds only to allowed users who mention @"
+        f"{BOT_USERNAME}, use a command like /status@{BOT_USERNAME}, or reply directly to the bot."
     )
 
 
@@ -225,23 +286,39 @@ def extract_prompt(text: str) -> tuple[str | None, bool]:
     if stripped.startswith("/copilot"):
         prompt = stripped[len("/copilot"):].strip()
         return prompt or None, True
+    if stripped.startswith("/") and "@" in stripped.split()[0]:
+        command, _, remainder = stripped.partition(" ")
+        normalized = normalize_command_token(command)
+        if normalized == "/copilot":
+            prompt = remainder.strip()
+            return prompt or None, True
+        return None, False
     if stripped.startswith("/"):
+        return None, False
+    if BOT_USERNAME:
+        stripped = re.sub(rf"(?i)@{re.escape(BOT_USERNAME)}\b[:,\-]?\s*", "", stripped).strip()
+    if not stripped:
         return None, False
     return stripped, True
 
 
 def handle_message(message: dict, state: dict) -> None:
     chat_id = message["chat"]["id"]
+    chat_type = message["chat"].get("type", "private")
     user_id = message["from"]["id"]
     message_id = message["message_id"]
     text = message.get("text", "")
 
     if user_id not in ALLOWED_USER_IDS:
-        send_message(chat_id, access_denied_text(user_id), message_id)
+        if chat_type == "private":
+            send_message(chat_id, access_denied_text(user_id), message_id)
+        return
+
+    if not should_handle_message(message, user_id, text):
         return
 
     session_state = get_session_state(state, user_id)
-    command = text.strip().split()[0] if text.strip().startswith("/") else ""
+    command = normalize_command_token(text.strip().split()[0]) if text.strip().startswith("/") else ""
 
     if command in {"/start", "/help"}:
         send_message(chat_id, help_text(), message_id)

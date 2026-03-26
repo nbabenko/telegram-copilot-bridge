@@ -30,6 +30,7 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
 2. Copy `.env.example` to `.env`.
 3. Edit `.env`:
    - set `TELEGRAM_BOT_TOKEN`
+  - set `BOT_USERNAME` or let the bridge resolve it via `getMe`
    - set `ALLOWED_USER_IDS`
    - set `REPO_PATH`
 4. Authenticate Copilot CLI on the machine:
@@ -52,6 +53,18 @@ python3 bot.py
 - `/status` - show repo and session status
 - `/copilot <prompt>` - send an explicit prompt
 - plain text message - send that text to Copilot
+
+## Group Chats
+
+The bot can be added to group chats.
+
+In groups, it responds only when the sender is whitelisted and one of these is true:
+
+- the message directly mentions the bot, for example `@your_bot_name explain this file`
+- the message uses a bot-addressed command such as `/status@your_bot_name`
+- the message is a reply to one of the bot's own messages
+
+Messages from non-whitelisted users are ignored in groups.
 
 ## Systemd
 
