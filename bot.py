@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import html
 import json
 import os
 import re
@@ -53,10 +54,17 @@ def telegram_request(method: str, payload: dict | None = None) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def send_message(chat_id: int, text: str, reply_to_message_id: int | None = None) -> None:
+def send_message(
+    chat_id: int,
+    text: str,
+    reply_to_message_id: int | None = None,
+    parse_mode: str | None = None,
+) -> None:
     payload = {"chat_id": str(chat_id), "text": text}
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = str(reply_to_message_id)
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
     telegram_request("sendMessage", payload)
 
 
@@ -95,6 +103,18 @@ def split_message(text: str, max_len: int = 3500) -> list[str]:
 def send_text_blocks(chat_id: int, text: str, reply_to_message_id: int | None = None) -> None:
     for chunk in split_message(text):
         send_message(chat_id, chunk, reply_to_message_id)
+
+
+def send_group_done_ack(chat_id: int, message: dict) -> None:
+    if (message.get("chat") or {}).get("type", "private") == "private":
+        return
+    from_user = message.get("from") or {}
+    user_id = from_user.get("id")
+    first_name = html.escape(str(from_user.get("first_name", "there")))
+    if not user_id:
+        return
+    text = f'<a href="tg://user?id={user_id}">{first_name}</a> Done'
+    send_message(chat_id, text, message.get("message_id"), parse_mode="HTML")
 
 
 def normalize_command_token(token: str) -> str:
@@ -322,22 +342,27 @@ def handle_message(message: dict, state: dict) -> None:
 
     if command in {"/start", "/help"}:
         send_message(chat_id, help_text(), message_id)
+        send_group_done_ack(chat_id, message)
         return
     if command == "/new":
         session_state["has_session"] = False
         save_state(state)
         send_message(chat_id, "Started a fresh Copilot thread for your account.", message_id)
+        send_group_done_ack(chat_id, message)
         return
     if command == "/status":
         send_message(chat_id, status_text(state, user_id), message_id)
+        send_group_done_ack(chat_id, message)
         return
 
     prompt, should_run = extract_prompt(text)
     if not should_run:
         send_message(chat_id, help_text(), message_id)
+        send_group_done_ack(chat_id, message)
         return
     if not prompt:
         send_message(chat_id, "Send text after /copilot, or just send a plain message.", message_id)
+        send_group_done_ack(chat_id, message)
         return
 
     send_typing(chat_id)
@@ -352,10 +377,12 @@ def handle_message(message: dict, state: dict) -> None:
         save_state(state)
         if not sent_any:
             send_message(chat_id, "Copilot returned no text.", message_id)
+        send_group_done_ack(chat_id, message)
         return
 
     if result:
         send_message(chat_id, f"Copilot failed:\n\n{result}", message_id)
+    send_group_done_ack(chat_id, message)
 
 
 def main() -> int:
