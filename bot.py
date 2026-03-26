@@ -114,9 +114,9 @@ def split_message(text: str, max_len: int = TELEGRAM_MESSAGE_MAX_LEN) -> list[st
     return chunks or [""]
 
 
-def send_text_blocks(chat_id: int, text: str, reply_to_message_id: int | None = None) -> None:
+def send_text_blocks(chat_id: int, text: str) -> None:
     for chunk in split_message(text):
-        send_message(chat_id, chunk, reply_to_message_id)
+        send_message(chat_id, chunk)
 
 
 def send_group_done_ack(chat_id: int, message: dict) -> None:
@@ -429,10 +429,10 @@ def run_upload_tool(local_path: Path, upload_name: str) -> tuple[bool, str]:
     return True, upload_result_text(parsed)
 
 
-def begin_upload_from_message(state: dict, user_id: int, chat_id: int, reply_to_message_id: int, source_message: dict) -> None:
+def begin_upload_from_message(state: dict, user_id: int, chat_id: int, source_message: dict) -> None:
     attachment = extract_attachment(source_message)
     if not attachment:
-        send_message(chat_id, "That message does not include downloadable media.", reply_to_message_id)
+        send_message(chat_id, "That message does not include downloadable media.")
         return
 
     clear_upload_session(state, user_id, cleanup_local_file=True)
@@ -440,7 +440,7 @@ def begin_upload_from_message(state: dict, user_id: int, chat_id: int, reply_to_
     try:
         attachment_path = download_telegram_file(*attachment)
     except Exception as error:
-        send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}", reply_to_message_id)
+        send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}")
         return
 
     source_name = attachment[1] or attachment_path.name
@@ -462,7 +462,6 @@ def begin_upload_from_message(state: dict, user_id: int, chat_id: int, reply_to_
             "The upload will fail if that name already exists.\n"
             "Use /cancel to discard this pending upload."
         ),
-        reply_to_message_id,
     )
 
 
@@ -478,43 +477,43 @@ def handle_pending_upload(message: dict, state: dict, upload_session: dict) -> b
 
     if command == "/cancel":
         clear_upload_session(state, user_id, cleanup_local_file=True)
-        send_message(chat_id, "Cancelled the pending upload.", message_id)
+        send_message(chat_id, "Cancelled the pending upload.")
         send_group_done_ack(chat_id, message)
         return True
 
     stage = upload_session.get("stage")
     if stage == "awaiting_media":
         if extract_attachment(message):
-            begin_upload_from_message(state, user_id, chat_id, message_id, message)
+            begin_upload_from_message(state, user_id, chat_id, message)
             send_group_done_ack(chat_id, message)
             return True
-        send_message(chat_id, "Send the media file to upload, or use /cancel.", message_id)
+        send_message(chat_id, "Send the media file to upload, or use /cancel.")
         return True
 
     if stage == "awaiting_name":
         if not text or command:
-            send_message(chat_id, "Send the storage name as plain text, or use /cancel.", message_id)
+            send_message(chat_id, "Send the storage name as plain text, or use /cancel.")
             return True
 
         local_path = Path(upload_session.get("local_path", ""))
         if not local_path.exists():
             clear_upload_session(state, user_id)
-            send_message(chat_id, "The pending upload file is no longer available. Start again with /upload.", message_id)
+            send_message(chat_id, "The pending upload file is no longer available. Start again with /upload.")
             return True
 
         send_typing(chat_id)
         success, result = run_upload_tool(local_path, text)
         if success:
             clear_upload_session(state, user_id, cleanup_local_file=True)
-            send_message(chat_id, result, message_id)
+            send_message(chat_id, result)
             send_group_done_ack(chat_id, message)
             return True
 
-        send_message(chat_id, f"Upload failed:\n\n{result}\n\nSend a different name, or use /cancel.", message_id)
+        send_message(chat_id, f"Upload failed:\n\n{result}\n\nSend a different name, or use /cancel.")
         return True
 
     clear_upload_session(state, user_id, cleanup_local_file=True)
-    send_message(chat_id, "Upload state was invalid and has been cleared. Start again with /upload.", message_id)
+    send_message(chat_id, "Upload state was invalid and has been cleared. Start again with /upload.")
     return True
 
 
@@ -645,21 +644,21 @@ def handle_message(message: dict, state: dict) -> None:
     command = normalize_command_token(text.strip().split()[0]) if text.strip().startswith("/") else ""
 
     if command in {"/start", "/help"}:
-        send_message(chat_id, help_text(), message_id)
+        send_message(chat_id, help_text())
         send_group_done_ack(chat_id, message)
         return
     if command == "/cancel":
-        send_message(chat_id, "There is no pending upload to cancel.", message_id)
+        send_message(chat_id, "There is no pending upload to cancel.")
         send_group_done_ack(chat_id, message)
         return
     if command == "/new":
         session_state["has_session"] = False
         save_state(state)
-        send_message(chat_id, "Started a fresh Copilot thread for your account.", message_id)
+        send_message(chat_id, "Started a fresh Copilot thread for your account.")
         send_group_done_ack(chat_id, message)
         return
     if command == "/status":
-        send_message(chat_id, status_text(state, user_id), message_id)
+        send_message(chat_id, status_text(state, user_id))
         send_group_done_ack(chat_id, message)
         return
     if command == "/upload":
@@ -668,12 +667,12 @@ def handle_message(message: dict, state: dict) -> None:
         reply_attachment = extract_attachment(reply_message) if reply_message else None
 
         if current_attachment:
-            begin_upload_from_message(state, user_id, chat_id, message_id, message)
+            begin_upload_from_message(state, user_id, chat_id, message)
         elif reply_attachment and reply_message:
-            begin_upload_from_message(state, user_id, chat_id, message_id, reply_message)
+            begin_upload_from_message(state, user_id, chat_id, reply_message)
         else:
             set_upload_session(state, user_id, {"chat_id": chat_id, "stage": "awaiting_media"})
-            send_message(chat_id, upload_help_text(), message_id)
+            send_message(chat_id, upload_help_text())
         send_group_done_ack(chat_id, message)
         return
 
@@ -683,7 +682,7 @@ def handle_message(message: dict, state: dict) -> None:
         try:
             attachment_path = download_telegram_file(*attachment)
         except Exception as error:
-            send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}", message_id)
+            send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}")
             send_group_done_ack(chat_id, message)
             return
 
@@ -708,11 +707,11 @@ def handle_message(message: dict, state: dict) -> None:
         prompt = default_reply_prompt()
         should_run = True
     if not should_run:
-        send_message(chat_id, help_text(), message_id)
+        send_message(chat_id, help_text())
         send_group_done_ack(chat_id, message)
         return
     if not prompt:
-        send_message(chat_id, "Send text after /copilot, or just send a plain message.", message_id)
+        send_message(chat_id, "Send text after /copilot, or just send a plain message.")
         send_group_done_ack(chat_id, message)
         return
 
@@ -729,22 +728,21 @@ def handle_message(message: dict, state: dict) -> None:
         prompt = f"{prompt}\n\n{append_referenced_download_warning(referenced_context, referenced_attachment_warning)}"
 
     send_typing(chat_id)
-    send_message(chat_id, "Working...", message_id)
+    send_message(chat_id, "Working...")
     success, sent_any, result = stream_copilot(
-        prompt,
         bool(session_state.get("has_session")),
-        lambda block: send_text_blocks(chat_id, block, message_id),
+        lambda block: send_text_blocks(chat_id, block),
     )
     if success:
         session_state["has_session"] = True
         save_state(state)
         if not sent_any:
-            send_message(chat_id, "Copilot returned no text.", message_id)
+            send_message(chat_id, "Copilot returned no text.")
         send_group_done_ack(chat_id, message)
         return
 
     if result:
-        send_message(chat_id, f"Copilot failed:\n\n{result}", message_id)
+        send_message(chat_id, f"Copilot failed:\n\n{result}")
     send_group_done_ack(chat_id, message)
 
 
