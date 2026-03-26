@@ -79,6 +79,11 @@ def split_message(text: str, max_len: int = 3500) -> list[str]:
     return chunks or [""]
 
 
+def send_text_blocks(chat_id: int, text: str, reply_to_message_id: int | None = None) -> None:
+    for chunk in split_message(text):
+        send_message(chat_id, chunk, reply_to_message_id)
+
+
 def load_state() -> dict:
     if not STATE_PATH.exists():
         return {"offset": 0, "sessions": {}}
@@ -145,25 +150,72 @@ def status_text(state: dict, user_id: int) -> str:
     )
 
 
-def run_copilot(prompt: str, continue_session: bool) -> tuple[bool, str]:
+def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool, bool, str]:
     command = [COPILOT_BIN]
     if continue_session:
         command.append("--continue")
     command.extend(["-p", prompt, "--allow-all-tools", "--no-color"])
-    process = subprocess.run(
+    process = subprocess.Popen(
         command,
         cwd=REPO_PATH,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=COPILOT_TIMEOUT,
+        bufsize=1,
         env=os.environ.copy(),
     )
-    stdout = process.stdout.strip()
-    stderr = process.stderr.strip()
-    combined = "\n\n".join(part for part in [stdout, stderr] if part).strip()
+    deadline = time.monotonic() + COPILOT_TIMEOUT
+    buffer: list[str] = []
+    sent_any = False
+    last_flush = time.monotonic()
+    assert process.stdout is not None
+
+    def flush_buffer() -> None:
+        nonlocal sent_any, last_flush
+        text = "".join(buffer).strip()
+        if not text:
+            buffer.clear()
+            return
+        on_block(text)
+        buffer.clear()
+        sent_any = True
+        last_flush = time.monotonic()
+
+    try:
+        while True:
+            if time.monotonic() > deadline:
+                process.kill()
+                flush_buffer()
+                return False, sent_any, f"Timed out after {COPILOT_TIMEOUT} seconds."
+
+            line = process.stdout.readline()
+            if line == "" and process.poll() is not None:
+                break
+            if line == "":
+                time.sleep(0.1)
+                continue
+
+            buffer.append(line)
+            current = "".join(buffer)
+            if line.strip() == "" and current.strip():
+                flush_buffer()
+                continue
+            if len(current) >= 3000:
+                flush_buffer()
+                continue
+            if time.monotonic() - last_flush >= 2 and current.strip():
+                flush_buffer()
+
+        process.wait(timeout=5)
+    except Exception as error:
+        process.kill()
+        flush_buffer()
+        return False, sent_any, str(error)
+
+    flush_buffer()
     if process.returncode == 0:
-        return True, combined or "Copilot returned no text."
-    return False, combined or f"Exit code {process.returncode}"
+        return True, sent_any, ""
+    return False, sent_any, f"Exit code {process.returncode}"
 
 
 def extract_prompt(text: str) -> tuple[str | None, bool]:
@@ -213,15 +265,20 @@ def handle_message(message: dict, state: dict) -> None:
 
     send_typing(chat_id)
     send_message(chat_id, "Working...", message_id)
-    success, result = run_copilot(prompt, bool(session_state.get("has_session")))
+    success, sent_any, result = stream_copilot(
+        prompt,
+        bool(session_state.get("has_session")),
+        lambda block: send_text_blocks(chat_id, block, message_id),
+    )
     if success:
         session_state["has_session"] = True
         save_state(state)
-        for chunk in split_message(result):
-            send_message(chat_id, chunk, message_id)
+        if not sent_any:
+            send_message(chat_id, "Copilot returned no text.", message_id)
         return
 
-    send_message(chat_id, f"Copilot failed:\n\n{result}", message_id)
+    if result:
+        send_message(chat_id, f"Copilot failed:\n\n{result}", message_id)
 
 
 def main() -> int:
