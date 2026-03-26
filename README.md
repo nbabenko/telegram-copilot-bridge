@@ -33,6 +33,7 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
   - set `BOT_USERNAME` or let the bridge resolve it via `getMe`
    - set `ALLOWED_USER_IDS`
    - set `REPO_PATH`
+  - set `UPLOAD_DIR` to a folder inside the target repository if you want uploaded files to be readable by Copilot without extra path permissions
 4. Authenticate Copilot CLI on the machine:
 
 ```bash
@@ -53,6 +54,17 @@ python3 bot.py
 - `/status` - show repo and session status
 - `/copilot <prompt>` - send an explicit prompt
 - plain text message - send that text to Copilot
+
+## File Uploads
+
+The bridge can process Telegram attachments such as documents and photos.
+
+- uploads are downloaded locally before Copilot is called
+- the downloaded path is appended to the Copilot prompt
+- by default, uploads are stored in `.telegram-copilot-uploads/` inside the configured repository
+- the bridge also passes `--add-dir` for that upload directory to Copilot CLI
+
+This keeps file paths accessible without requiring manual approval for unrelated locations.
 
 ## Group Chats
 

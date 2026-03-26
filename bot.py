@@ -36,11 +36,16 @@ ALLOWED_USER_IDS = {
     if item.strip()
 }
 REPO_PATH = os.environ.get("REPO_PATH", str(BASE_DIR))
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(Path(REPO_PATH) / ".telegram-copilot-uploads")))
 COPILOT_BIN = os.environ.get("COPILOT_BIN", "/usr/bin/copilot")
 COPILOT_TIMEOUT = int(os.environ.get("COPILOT_TIMEOUT", "1200"))
 TELEGRAM_TIMEOUT = int(os.environ.get("TELEGRAM_TIMEOUT", "30"))
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@").lower()
+TELEGRAM_MESSAGE_MAX_LEN = 3900
+STREAM_FLUSH_MAX_LEN = 3600
+STREAM_FLUSH_INTERVAL = 4.0
+STREAM_FLUSH_MIN_PARAGRAPH_LEN = 1200
 
 
 def telegram_request(method: str, payload: dict | None = None) -> dict:
@@ -72,6 +77,14 @@ def send_typing(chat_id: int) -> None:
     telegram_request("sendChatAction", {"chat_id": str(chat_id), "action": "typing"})
 
 
+def get_message_text(message: dict) -> str:
+    return message.get("text") or message.get("caption") or ""
+
+
+def get_message_entities(message: dict) -> list[dict]:
+    return message.get("entities") or message.get("caption_entities") or []
+
+
 def resolve_bot_username() -> str:
     result = telegram_request("getMe")
     if not result.get("ok"):
@@ -83,7 +96,7 @@ if not BOT_USERNAME:
     BOT_USERNAME = resolve_bot_username()
 
 
-def split_message(text: str, max_len: int = 3500) -> list[str]:
+def split_message(text: str, max_len: int = TELEGRAM_MESSAGE_MAX_LEN) -> list[str]:
     chunks: list[str] = []
     remaining = text.strip()
     while remaining:
@@ -138,7 +151,7 @@ def is_reply_to_bot(message: dict) -> bool:
 def message_mentions_bot(message: dict, text: str) -> bool:
     if not BOT_USERNAME:
         return False
-    for entity in message.get("entities", []):
+    for entity in get_message_entities(message):
         if entity.get("type") != "mention":
             continue
         offset = entity.get("offset", 0)
@@ -161,6 +174,52 @@ def should_handle_message(message: dict, user_id: int, text: str) -> bool:
     if is_reply_to_bot(message):
         return True
     return message_mentions_bot(message, text)
+
+
+def sanitize_filename(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return cleaned or "telegram_file"
+
+
+def download_telegram_file(file_id: str, preferred_name: str | None = None) -> Path:
+    file_info = telegram_request("getFile", {"file_id": file_id})
+    if not file_info.get("ok"):
+        raise RuntimeError("Failed to resolve Telegram file path")
+    file_path = file_info["result"].get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram did not return a downloadable file path")
+
+    source_name = preferred_name or Path(file_path).name
+    safe_name = sanitize_filename(source_name)
+    target = UPLOAD_DIR / f"{int(time.time())}_{safe_name}"
+    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    with urllib.request.urlopen(download_url, timeout=TELEGRAM_TIMEOUT + 30) as response:
+        target.write_bytes(response.read())
+    return target
+
+
+def extract_attachment(message: dict) -> tuple[str, str | None] | None:
+    document = message.get("document")
+    if document:
+        return document.get("file_id"), document.get("file_name")
+
+    photo = message.get("photo") or []
+    if photo:
+        return photo[-1].get("file_id"), "telegram_photo.jpg"
+
+    audio = message.get("audio")
+    if audio:
+        return audio.get("file_id"), audio.get("file_name") or "telegram_audio"
+
+    video = message.get("video")
+    if video:
+        return video.get("file_id"), video.get("file_name") or "telegram_video.mp4"
+
+    voice = message.get("voice")
+    if voice:
+        return voice.get("file_id"), "telegram_voice.ogg"
+
+    return None
 
 
 def load_state() -> dict:
@@ -235,7 +294,14 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
     command = [COPILOT_BIN]
     if continue_session:
         command.append("--continue")
-    command.extend(["-p", prompt, "--allow-all-tools", "--no-color"])
+    command.extend([
+        "-p",
+        prompt,
+        "--allow-all-tools",
+        "--no-color",
+        "--add-dir",
+        str(UPLOAD_DIR),
+    ])
     process = subprocess.Popen(
         command,
         cwd=REPO_PATH,
@@ -278,13 +344,13 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
 
             buffer.append(line)
             current = "".join(buffer)
-            if line.strip() == "" and current.strip():
+            if line.strip() == "" and len(current.strip()) >= STREAM_FLUSH_MIN_PARAGRAPH_LEN:
                 flush_buffer()
                 continue
-            if len(current) >= 3000:
+            if len(current) >= STREAM_FLUSH_MAX_LEN:
                 flush_buffer()
                 continue
-            if time.monotonic() - last_flush >= 2 and current.strip():
+            if time.monotonic() - last_flush >= STREAM_FLUSH_INTERVAL and current.strip():
                 flush_buffer()
 
         process.wait(timeout=5)
@@ -327,11 +393,11 @@ def handle_message(message: dict, state: dict) -> None:
     chat_type = message["chat"].get("type", "private")
     user_id = message["from"]["id"]
     message_id = message["message_id"]
-    text = message.get("text", "")
+    text = get_message_text(message)
 
     if user_id not in ALLOWED_USER_IDS:
         if chat_type == "private":
-            send_message(chat_id, access_denied_text(user_id), message_id)
+            send_message(chat_id, access_denied_text(user_id))
         return
 
     if not should_handle_message(message, user_id, text):
@@ -341,52 +407,71 @@ def handle_message(message: dict, state: dict) -> None:
     command = normalize_command_token(text.strip().split()[0]) if text.strip().startswith("/") else ""
 
     if command in {"/start", "/help"}:
-        send_message(chat_id, help_text(), message_id)
+        send_message(chat_id, help_text())
         send_group_done_ack(chat_id, message)
         return
     if command == "/new":
         session_state["has_session"] = False
         save_state(state)
-        send_message(chat_id, "Started a fresh Copilot thread for your account.", message_id)
+        send_message(chat_id, "Started a fresh Copilot thread for your account.")
         send_group_done_ack(chat_id, message)
         return
     if command == "/status":
-        send_message(chat_id, status_text(state, user_id), message_id)
+        send_message(chat_id, status_text(state, user_id))
         send_group_done_ack(chat_id, message)
         return
+
+    attachment_path = None
+    attachment = extract_attachment(message)
+    if attachment:
+        try:
+            attachment_path = download_telegram_file(*attachment)
+        except Exception as error:
+            send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}")
+            send_group_done_ack(chat_id, message)
+            return
 
     prompt, should_run = extract_prompt(text)
     if not should_run:
-        send_message(chat_id, help_text(), message_id)
+        send_message(chat_id, help_text())
         send_group_done_ack(chat_id, message)
         return
     if not prompt:
-        send_message(chat_id, "Send text after /copilot, or just send a plain message.", message_id)
+        send_message(chat_id, "Send text after /copilot, or just send a plain message.")
         send_group_done_ack(chat_id, message)
         return
 
+    if attachment_path is not None:
+        prompt = (
+            f"{prompt}\n\n"
+            f"Use the uploaded Telegram file at: {attachment_path}\n"
+            f"This file is stored inside the repository-accessible upload directory.\n"
+            f"Read and process that file directly from disk."
+        )
+
     send_typing(chat_id)
-    send_message(chat_id, "Working...", message_id)
+    send_message(chat_id, "Working...")
     success, sent_any, result = stream_copilot(
         prompt,
         bool(session_state.get("has_session")),
-        lambda block: send_text_blocks(chat_id, block, message_id),
+        lambda block: send_text_blocks(chat_id, block),
     )
     if success:
         session_state["has_session"] = True
         save_state(state)
         if not sent_any:
-            send_message(chat_id, "Copilot returned no text.", message_id)
+            send_message(chat_id, "Copilot returned no text.")
         send_group_done_ack(chat_id, message)
         return
 
     if result:
-        send_message(chat_id, f"Copilot failed:\n\n{result}", message_id)
+        send_message(chat_id, f"Copilot failed:\n\n{result}")
     send_group_done_ack(chat_id, message)
 
 
 def main() -> int:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()
     while True:
         try:
@@ -398,7 +483,7 @@ def main() -> int:
                 state["offset"] = update["update_id"] + 1
                 save_state(state)
                 message = update.get("message")
-                if message and "text" in message:
+                if message and ("text" in message or "caption" in message or extract_attachment(message)):
                     handle_message(message, state)
         except KeyboardInterrupt:
             return 0
