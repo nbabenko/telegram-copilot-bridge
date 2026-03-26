@@ -130,6 +130,40 @@ def send_group_done_ack(chat_id: int, message: dict) -> None:
     send_message(chat_id, text, message.get("message_id"), parse_mode="HTML")
 
 
+def format_user_label(user: dict) -> str:
+    username = str(user.get("username", "")).strip()
+    first_name = str(user.get("first_name", "")).strip()
+    last_name = str(user.get("last_name", "")).strip()
+    full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+    if username and full_name:
+        return f"{full_name} (@{username})"
+    if username:
+        return f"@{username}"
+    if full_name:
+        return full_name
+    return f"user {user.get('id', 'unknown')}"
+
+
+def build_referenced_message_context(message: dict, attachment_path: Path | None = None) -> str:
+    parts = [
+        "Referenced Telegram message:",
+        f"From: {format_user_label(message.get('from') or {})}",
+    ]
+    text = get_message_text(message).strip()
+    if text:
+        parts.extend(["Content:", text])
+    else:
+        parts.append("Content: <no text>")
+    if attachment_path is not None:
+        parts.append(f"Attachment saved at: {attachment_path}")
+    elif extract_attachment(message):
+        parts.append("Attachment: present in Telegram, but no local file was downloaded.")
+    parts.append(
+        "If the user's request says things like 'check this message' or 'reply to this', use the referenced message as the primary context."
+    )
+    return "\n".join(parts)
+
+
 def normalize_command_token(token: str) -> str:
     if not token.startswith("/"):
         return token
@@ -388,6 +422,10 @@ def extract_prompt(text: str) -> tuple[str | None, bool]:
     return stripped, True
 
 
+def default_reply_prompt() -> str:
+    return "Review the referenced Telegram message and respond to it."
+
+
 def handle_message(message: dict, state: dict) -> None:
     chat_id = message["chat"]["id"]
     chat_type = message["chat"].get("type", "private")
@@ -407,17 +445,17 @@ def handle_message(message: dict, state: dict) -> None:
     command = normalize_command_token(text.strip().split()[0]) if text.strip().startswith("/") else ""
 
     if command in {"/start", "/help"}:
-        send_message(chat_id, help_text())
+        send_message(chat_id, help_text(), message_id)
         send_group_done_ack(chat_id, message)
         return
     if command == "/new":
         session_state["has_session"] = False
         save_state(state)
-        send_message(chat_id, "Started a fresh Copilot thread for your account.")
+        send_message(chat_id, "Started a fresh Copilot thread for your account.", message_id)
         send_group_done_ack(chat_id, message)
         return
     if command == "/status":
-        send_message(chat_id, status_text(state, user_id))
+        send_message(chat_id, status_text(state, user_id), message_id)
         send_group_done_ack(chat_id, message)
         return
 
@@ -427,17 +465,32 @@ def handle_message(message: dict, state: dict) -> None:
         try:
             attachment_path = download_telegram_file(*attachment)
         except Exception as error:
-            send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}")
+            send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}", message_id)
             send_group_done_ack(chat_id, message)
             return
 
+    referenced_message = message.get("reply_to_message")
+    referenced_attachment_path = None
+    if referenced_message:
+        referenced_attachment = extract_attachment(referenced_message)
+        if referenced_attachment:
+            try:
+                referenced_attachment_path = download_telegram_file(*referenced_attachment)
+            except Exception as error:
+                send_message(chat_id, f"Failed to download the referenced Telegram attachment:\n\n{error}", message_id)
+                send_group_done_ack(chat_id, message)
+                return
+
     prompt, should_run = extract_prompt(text)
+    if referenced_message and not prompt:
+        prompt = default_reply_prompt()
+        should_run = True
     if not should_run:
-        send_message(chat_id, help_text())
+        send_message(chat_id, help_text(), message_id)
         send_group_done_ack(chat_id, message)
         return
     if not prompt:
-        send_message(chat_id, "Send text after /copilot, or just send a plain message.")
+        send_message(chat_id, "Send text after /copilot, or just send a plain message.", message_id)
         send_group_done_ack(chat_id, message)
         return
 
@@ -449,23 +502,26 @@ def handle_message(message: dict, state: dict) -> None:
             f"Read and process that file directly from disk."
         )
 
+    if referenced_message:
+        prompt = f"{prompt}\n\n{build_referenced_message_context(referenced_message, referenced_attachment_path)}"
+
     send_typing(chat_id)
-    send_message(chat_id, "Working...")
+    send_message(chat_id, "Working...", message_id)
     success, sent_any, result = stream_copilot(
         prompt,
         bool(session_state.get("has_session")),
-        lambda block: send_text_blocks(chat_id, block),
+        lambda block: send_text_blocks(chat_id, block, message_id),
     )
     if success:
         session_state["has_session"] = True
         save_state(state)
         if not sent_any:
-            send_message(chat_id, "Copilot returned no text.")
+            send_message(chat_id, "Copilot returned no text.", message_id)
         send_group_done_ack(chat_id, message)
         return
 
     if result:
-        send_message(chat_id, f"Copilot failed:\n\n{result}")
+        send_message(chat_id, f"Copilot failed:\n\n{result}", message_id)
     send_group_done_ack(chat_id, message)
 
 

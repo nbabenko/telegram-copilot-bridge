@@ -9,6 +9,7 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
 - Runs `copilot -p` inside a configured repository
 - Continues Copilot context per Telegram user
 - Returns full Copilot CLI output as plain Telegram messages
+- Includes replied-to Telegram message text and attachments as Copilot context
 
 ## Requirements
 
@@ -76,6 +77,12 @@ In groups, it responds only when the sender is whitelisted and one of these is t
 - the message uses a bot-addressed command such as `/status@your_bot_name`
 - the message is a reply to one of the bot's own messages
 
+When you reply to another Telegram message and mention the bot, the bridge now appends the referenced message text and any referenced attachment path to the Copilot prompt.
+
+No Telegram setting change is required for reply-context support if you already mention the bot when replying.
+
+If you want the bot to trigger on ordinary group messages without being mentioned, that is a separate behavior change: you would need to disable privacy mode in BotFather with `/setprivacy` and also relax the group trigger rules in [bot.py](bot.py#L199).
+
 Messages from non-whitelisted users are ignored in groups.
 
 ## Systemd
@@ -101,5 +108,6 @@ sudo systemctl enable --now telegram-copilot-bridge.service
 ## Notes
 
 - This bridge is text-only. It does not render screenshots.
+- It can include the text and downloadable file from a replied-to Telegram message, but it still cannot interpret image pixels from a screenshot.
 - It uses long polling, not webhooks.
 - Session continuation is tracked per Telegram user ID in `state.json`.
