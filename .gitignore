@@ -3,3 +3,4 @@ state.json
 .telegram-copilot-uploads/
 __pycache__/
 *.pyc
+node_modules/

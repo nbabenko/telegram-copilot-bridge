@@ -46,6 +46,7 @@ TELEGRAM_MESSAGE_MAX_LEN = 3900
 STREAM_FLUSH_MAX_LEN = 3600
 STREAM_FLUSH_INTERVAL = 4.0
 STREAM_FLUSH_MIN_PARAGRAPH_LEN = 1200
+UPLOAD_TOOL = BASE_DIR / "scripts" / "upload-media.mjs"
 
 
 def telegram_request(method: str, payload: dict | None = None) -> dict:
@@ -164,6 +165,12 @@ def build_referenced_message_context(message: dict, attachment_path: Path | None
     return "\n".join(parts)
 
 
+def append_referenced_download_warning(context: str, warning: str | None) -> str:
+    if not warning:
+        return context
+    return f"{context}\nDownload warning: {warning}"
+
+
 def normalize_command_token(token: str) -> str:
     if not token.startswith("/"):
         return token
@@ -226,13 +233,18 @@ def download_telegram_file(file_id: str, preferred_name: str | None = None) -> P
     source_name = preferred_name or Path(file_path).name
     safe_name = sanitize_filename(source_name)
     target = UPLOAD_DIR / f"{int(time.time())}_{safe_name}"
-    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    encoded_path = urllib.parse.quote(file_path, safe="/")
+    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{encoded_path}"
     with urllib.request.urlopen(download_url, timeout=TELEGRAM_TIMEOUT + 30) as response:
         target.write_bytes(response.read())
     return target
 
 
 def extract_attachment(message: dict) -> tuple[str, str | None] | None:
+    animation = message.get("animation")
+    if animation:
+        return animation.get("file_id"), animation.get("file_name") or "telegram_animation.mp4"
+
     document = message.get("document")
     if document:
         return document.get("file_id"), document.get("file_name")
@@ -249,9 +261,23 @@ def extract_attachment(message: dict) -> tuple[str, str | None] | None:
     if video:
         return video.get("file_id"), video.get("file_name") or "telegram_video.mp4"
 
+    video_note = message.get("video_note")
+    if video_note:
+        return video_note.get("file_id"), "telegram_video_note.mp4"
+
     voice = message.get("voice")
     if voice:
         return voice.get("file_id"), "telegram_voice.ogg"
+
+    paid_media = message.get("paid_media") or {}
+    for item in paid_media.get("paid_media") or []:
+        if item.get("type") == "video" and item.get("video"):
+            video = item["video"]
+            return video.get("file_id"), video.get("file_name") or "telegram_paid_video.mp4"
+        if item.get("type") == "photo" and item.get("photo"):
+            photo = item.get("photo") or []
+            if photo:
+                return photo[-1].get("file_id"), "telegram_paid_photo.jpg"
 
     return None
 
@@ -277,6 +303,30 @@ def get_session_state(state: dict, user_id: int) -> dict:
     return sessions[session_key]
 
 
+def get_upload_session(state: dict, user_id: int) -> dict | None:
+    uploads = state.setdefault("uploads", {})
+    return uploads.get(str(user_id))
+
+
+def set_upload_session(state: dict, user_id: int, session: dict) -> None:
+    uploads = state.setdefault("uploads", {})
+    uploads[str(user_id)] = session
+    save_state(state)
+
+
+def clear_upload_session(state: dict, user_id: int, cleanup_local_file: bool = False) -> None:
+    uploads = state.setdefault("uploads", {})
+    session = uploads.pop(str(user_id), None)
+    if cleanup_local_file and session:
+        local_path = session.get("local_path")
+        if local_path:
+            try:
+                Path(local_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+    save_state(state)
+
+
 def access_denied_text(user_id: int) -> str:
     return (
         "You don't have access to this bot.\n\n"
@@ -294,6 +344,8 @@ def help_text() -> str:
         "/help - show this help\n"
         "/new - start a fresh Copilot thread for your account\n"
         "/status - show bridge status\n"
+        "/upload - upload Telegram media to object storage\n"
+        "/cancel - cancel a pending upload\n"
         "/copilot <prompt> - send a prompt immediately\n\n"
         "Any plain text message is sent to Copilot in the configured repository.\n"
         "Telegram receives the full raw Copilot CLI output, not only the final summary.\n\n"
@@ -320,8 +372,150 @@ def status_text(state: dict, user_id: int) -> str:
         f"Repo: {REPO_PATH}\n"
         f"Branch: {branch}\n"
         f"Whitelisted users: {len(ALLOWED_USER_IDS)}\n"
-        f"Session state: {'continuing' if session_state.get('has_session') else 'new'}"
+        f"Session state: {'continuing' if session_state.get('has_session') else 'new'}\n"
+        f"Upload tool: {'configured' if UPLOAD_TOOL.exists() else 'missing'}"
     )
+
+
+def upload_help_text() -> str:
+    return (
+        "Upload workflow:\n"
+        "/upload with attached media, or reply /upload to a message that already has media.\n"
+        "If you send /upload by itself, the bot will wait for your next media message.\n"
+        "After the file is downloaded, send the storage name as plain text.\n"
+        "Use /cancel to abort a pending upload."
+    )
+
+
+def upload_result_text(result: dict) -> str:
+    lines = [
+        "Upload complete.",
+        f"Key: {result.get('key', 'unknown')}",
+        f"URL: {result.get('url', 'unknown')}",
+        f"Content-Type: {result.get('contentType', 'unknown')}",
+    ]
+    transcoded_from = result.get("transcodedFrom")
+    if transcoded_from:
+        lines.append(f"Converted from: {transcoded_from}")
+    return "\n".join(lines)
+
+
+def run_upload_tool(local_path: Path, upload_name: str) -> tuple[bool, str]:
+    if not UPLOAD_TOOL.exists():
+        return False, f"Upload helper not found at {UPLOAD_TOOL}"
+
+    try:
+        result = subprocess.run(
+            ["node", str(UPLOAD_TOOL), "--file", str(local_path), "--name", upload_name],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=COPILOT_TIMEOUT,
+            check=False,
+            env=os.environ.copy(),
+        )
+    except Exception as error:
+        return False, str(error)
+
+    if result.returncode != 0:
+        output = result.stderr.strip() or result.stdout.strip() or f"Exit code {result.returncode}"
+        return False, output
+
+    try:
+        parsed = json.loads(result.stdout)
+    except Exception as error:
+        return False, f"Upload helper returned invalid JSON: {error}"
+
+    return True, upload_result_text(parsed)
+
+
+def begin_upload_from_message(state: dict, user_id: int, chat_id: int, reply_to_message_id: int, source_message: dict) -> None:
+    attachment = extract_attachment(source_message)
+    if not attachment:
+        send_message(chat_id, "That message does not include downloadable media.", reply_to_message_id)
+        return
+
+    clear_upload_session(state, user_id, cleanup_local_file=True)
+
+    try:
+        attachment_path = download_telegram_file(*attachment)
+    except Exception as error:
+        send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}", reply_to_message_id)
+        return
+
+    source_name = attachment[1] or attachment_path.name
+    set_upload_session(
+        state,
+        user_id,
+        {
+            "chat_id": chat_id,
+            "stage": "awaiting_name",
+            "local_path": str(attachment_path),
+            "source_name": source_name,
+        },
+    )
+    send_message(
+        chat_id,
+        (
+            f"Downloaded: {source_name}\n"
+            "Send the storage name as plain text.\n"
+            "The upload will fail if that name already exists.\n"
+            "Use /cancel to discard this pending upload."
+        ),
+        reply_to_message_id,
+    )
+
+
+def handle_pending_upload(message: dict, state: dict, upload_session: dict) -> bool:
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    message_id = message["message_id"]
+    text = get_message_text(message).strip()
+    command = normalize_command_token(text.split()[0]) if text.startswith("/") else ""
+
+    if upload_session.get("chat_id") != chat_id:
+        return False
+
+    if command == "/cancel":
+        clear_upload_session(state, user_id, cleanup_local_file=True)
+        send_message(chat_id, "Cancelled the pending upload.", message_id)
+        send_group_done_ack(chat_id, message)
+        return True
+
+    stage = upload_session.get("stage")
+    if stage == "awaiting_media":
+        if extract_attachment(message):
+            begin_upload_from_message(state, user_id, chat_id, message_id, message)
+            send_group_done_ack(chat_id, message)
+            return True
+        send_message(chat_id, "Send the media file to upload, or use /cancel.", message_id)
+        return True
+
+    if stage == "awaiting_name":
+        if not text or command:
+            send_message(chat_id, "Send the storage name as plain text, or use /cancel.", message_id)
+            return True
+
+        local_path = Path(upload_session.get("local_path", ""))
+        if not local_path.exists():
+            clear_upload_session(state, user_id)
+            send_message(chat_id, "The pending upload file is no longer available. Start again with /upload.", message_id)
+            return True
+
+        send_typing(chat_id)
+        success, result = run_upload_tool(local_path, text)
+        if success:
+            clear_upload_session(state, user_id, cleanup_local_file=True)
+            send_message(chat_id, result, message_id)
+            send_group_done_ack(chat_id, message)
+            return True
+
+        send_message(chat_id, f"Upload failed:\n\n{result}\n\nSend a different name, or use /cancel.", message_id)
+        return True
+
+    clear_upload_session(state, user_id, cleanup_local_file=True)
+    send_message(chat_id, "Upload state was invalid and has been cleared. Start again with /upload.", message_id)
+    return True
 
 
 def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool, bool, str]:
@@ -438,7 +632,13 @@ def handle_message(message: dict, state: dict) -> None:
             send_message(chat_id, access_denied_text(user_id))
         return
 
-    if not should_handle_message(message, user_id, text):
+    upload_session = get_upload_session(state, user_id)
+    upload_session_active = bool(upload_session and upload_session.get("chat_id") == chat_id)
+
+    if not should_handle_message(message, user_id, text) and not upload_session_active:
+        return
+
+    if upload_session_active and handle_pending_upload(message, state, upload_session):
         return
 
     session_state = get_session_state(state, user_id)
@@ -446,6 +646,10 @@ def handle_message(message: dict, state: dict) -> None:
 
     if command in {"/start", "/help"}:
         send_message(chat_id, help_text(), message_id)
+        send_group_done_ack(chat_id, message)
+        return
+    if command == "/cancel":
+        send_message(chat_id, "There is no pending upload to cancel.", message_id)
         send_group_done_ack(chat_id, message)
         return
     if command == "/new":
@@ -456,6 +660,20 @@ def handle_message(message: dict, state: dict) -> None:
         return
     if command == "/status":
         send_message(chat_id, status_text(state, user_id), message_id)
+        send_group_done_ack(chat_id, message)
+        return
+    if command == "/upload":
+        current_attachment = extract_attachment(message)
+        reply_message = message.get("reply_to_message")
+        reply_attachment = extract_attachment(reply_message) if reply_message else None
+
+        if current_attachment:
+            begin_upload_from_message(state, user_id, chat_id, message_id, message)
+        elif reply_attachment and reply_message:
+            begin_upload_from_message(state, user_id, chat_id, message_id, reply_message)
+        else:
+            set_upload_session(state, user_id, {"chat_id": chat_id, "stage": "awaiting_media"})
+            send_message(chat_id, upload_help_text(), message_id)
         send_group_done_ack(chat_id, message)
         return
 
@@ -471,15 +689,19 @@ def handle_message(message: dict, state: dict) -> None:
 
     referenced_message = message.get("reply_to_message")
     referenced_attachment_path = None
+    referenced_attachment_warning = None
     if referenced_message:
         referenced_attachment = extract_attachment(referenced_message)
         if referenced_attachment:
             try:
                 referenced_attachment_path = download_telegram_file(*referenced_attachment)
             except Exception as error:
-                send_message(chat_id, f"Failed to download the referenced Telegram attachment:\n\n{error}", message_id)
-                send_group_done_ack(chat_id, message)
-                return
+                referenced_attachment_warning = str(error)
+                print(
+                    f"bridge warning: failed to download referenced attachment for message {message_id}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     prompt, should_run = extract_prompt(text)
     if referenced_message and not prompt:
@@ -503,7 +725,8 @@ def handle_message(message: dict, state: dict) -> None:
         )
 
     if referenced_message:
-        prompt = f"{prompt}\n\n{build_referenced_message_context(referenced_message, referenced_attachment_path)}"
+        referenced_context = build_referenced_message_context(referenced_message, referenced_attachment_path)
+        prompt = f"{prompt}\n\n{append_referenced_download_warning(referenced_context, referenced_attachment_warning)}"
 
     send_typing(chat_id)
     send_message(chat_id, "Working...", message_id)

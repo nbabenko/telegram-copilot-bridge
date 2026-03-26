@@ -10,19 +10,24 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
 - Continues Copilot context per Telegram user
 - Returns full Copilot CLI output as plain Telegram messages
 - Includes replied-to Telegram message text and attachments as Copilot context
+- Accepts `/upload`, asks for a storage name, and uploads Telegram media without overwriting existing names
 
 ## Requirements
 
 - Linux VM or server
 - Python 3
+- Node.js and npm
 - GitHub Copilot CLI installed and authenticated
 - A Telegram bot token from BotFather
 - At least one Telegram numeric user ID to whitelist
+- Object storage credentials for uploads
+- `ffmpeg` if `.mov` inputs should be converted to MP4 automatically
 
 ## Files
 
 - `bot.py` - the bridge process
 - `.env.example` - environment template
+- `scripts/upload-media.mjs` - upload helper used by `/upload`
 - `deploy/telegram-copilot-bridge.service.example` - systemd service template
 
 ## Setup
@@ -35,13 +40,19 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
    - set `ALLOWED_USER_IDS`
    - set `REPO_PATH`
   - set `UPLOAD_DIR` to a folder inside the target repository if you want uploaded files to be readable by Copilot without extra path permissions
-4. Authenticate Copilot CLI on the machine:
+  - set the `OBJECT_STORAGE_*` variables if `/upload` should work
+4. Install the upload-helper dependency:
+
+```bash
+npm install
+```
+5. Authenticate Copilot CLI on the machine:
 
 ```bash
 copilot login
 ```
 
-5. Start locally for a quick test:
+6. Start locally for a quick test:
 
 ```bash
 python3 bot.py
@@ -53,6 +64,8 @@ python3 bot.py
 - `/help` - show help
 - `/new` - start a fresh Copilot thread for the current Telegram account
 - `/status` - show repo and session status
+- `/upload` - upload Telegram media to object storage after you provide a name
+- `/cancel` - cancel a pending upload
 - `/copilot <prompt>` - send an explicit prompt
 - plain text message - send that text to Copilot
 
@@ -66,6 +79,19 @@ The bridge can process Telegram attachments such as documents and photos.
 - the bridge also passes `--add-dir` for that upload directory to Copilot CLI
 
 This keeps file paths accessible without requiring manual approval for unrelated locations.
+
+## Storage Uploads
+
+`/upload` is separate from the Copilot flow.
+
+- send `/upload` with attached media, or reply `/upload` to a Telegram message that already has media
+- if you send `/upload` without media first, the bridge waits for your next media message
+- after the file is downloaded locally, the bridge asks for a storage name
+- the upload helper refuses to overwrite an existing object key
+- `.mov` files are converted to `.mp4` with `ffmpeg` before upload
+- other file types are uploaded as-is and keep their extension
+
+The current key pattern is `uploads/<name><extension>`. Override the prefix with `OBJECT_STORAGE_PREFIX` if needed.
 
 ## Group Chats
 
