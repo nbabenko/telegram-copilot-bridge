@@ -47,6 +47,15 @@ STREAM_FLUSH_MAX_LEN = 3600
 STREAM_FLUSH_INTERVAL = 4.0
 STREAM_FLUSH_MIN_PARAGRAPH_LEN = 1200
 UPLOAD_TOOL = BASE_DIR / "scripts" / "upload-media.mjs"
+BOT_COMMANDS = [
+    {"command": "start", "description": "Show help and quick start"},
+    {"command": "help", "description": "Show help and commands"},
+    {"command": "new", "description": "Start a fresh Copilot thread"},
+    {"command": "status", "description": "Show bridge and session status"},
+    {"command": "upload", "description": "Upload Telegram media to object storage"},
+    {"command": "cancel", "description": "Cancel a pending upload"},
+    {"command": "copilot", "description": "Send an explicit prompt to Copilot"},
+]
 
 
 def telegram_request(method: str, payload: dict | None = None) -> dict:
@@ -91,6 +100,22 @@ def resolve_bot_username() -> str:
     if not result.get("ok"):
         raise RuntimeError("Unable to resolve Telegram bot username")
     return str(result["result"].get("username", "")).strip().lstrip("@").lower()
+
+
+def sync_bot_commands() -> None:
+    result = telegram_request(
+        "setMyCommands",
+        {"commands": json.dumps(BOT_COMMANDS, separators=(",", ":"))},
+    )
+    if not result.get("ok"):
+        raise RuntimeError("Unable to update Telegram bot commands")
+
+
+def sync_bot_commands_safe() -> None:
+    try:
+        sync_bot_commands()
+    except Exception as error:
+        print(f"bridge warning: failed to sync Telegram bot commands: {error}", file=sys.stderr, flush=True)
 
 
 if not BOT_USERNAME:
@@ -336,17 +361,13 @@ def access_denied_text(user_id: int) -> str:
 
 
 def help_text() -> str:
+    command_lines = "\n".join(
+        f"/{item['command']} - {item['description']}" for item in BOT_COMMANDS
+    )
     return (
         "Telegram Copilot Bridge\n\n"
         f"Repo: {REPO_PATH}\n\n"
-        "Commands:\n"
-        "/start - show this help\n"
-        "/help - show this help\n"
-        "/new - start a fresh Copilot thread for your account\n"
-        "/status - show bridge status\n"
-        "/upload - upload Telegram media to object storage\n"
-        "/cancel - cancel a pending upload\n"
-        "/copilot <prompt> - send a prompt immediately\n\n"
+        f"Commands:\n{command_lines}\n\n"
         "Any plain text message is sent to Copilot in the configured repository.\n"
         "Telegram receives the full raw Copilot CLI output, not only the final summary.\n\n"
         "In group chats, the bot responds only to allowed users who mention @"
@@ -730,6 +751,7 @@ def handle_message(message: dict, state: dict) -> None:
     send_typing(chat_id)
     send_message(chat_id, "Working...")
     success, sent_any, result = stream_copilot(
+        prompt,
         bool(session_state.get("has_session")),
         lambda block: send_text_blocks(chat_id, block),
     )
@@ -749,6 +771,7 @@ def handle_message(message: dict, state: dict) -> None:
 def main() -> int:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    sync_bot_commands_safe()
     state = load_state()
     while True:
         try:
