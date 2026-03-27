@@ -49,11 +49,21 @@ STREAM_FLUSH_INTERVAL = 4.0
 STREAM_FLUSH_MIN_PARAGRAPH_LEN = 1200
 UPLOAD_TOOL = BASE_DIR / "scripts" / "upload-media.mjs"
 DEBUG_TRACE_MAX_CHARS = 400000
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_ACTIONS_REPO = os.environ.get("GITHUB_ACTIONS_REPO", "").strip()
+GITHUB_POLL_INTERVAL = max(15, int(os.environ.get("GITHUB_POLL_INTERVAL", "45")))
+ACTION_SELECTION_TTL = 900
+ACTION_RUNS_PER_WORKFLOW = 10
 BOT_COMMANDS = [
     {"command": "start", "description": "Show help and quick start"},
     {"command": "help", "description": "Show help and commands"},
     {"command": "new", "description": "Start a fresh Copilot thread"},
     {"command": "status", "description": "Show bridge and session status"},
+    {"command": "actions", "description": "List GitHub Actions workflows"},
+    {"command": "subscriptions", "description": "Show this chat's workflow subscriptions"},
+    {"command": "watch", "description": "Subscribe this chat to a workflow"},
+    {"command": "unwatch", "description": "Unsubscribe this chat from a workflow"},
     {"command": "upload", "description": "Upload Telegram media to object storage"},
     {"command": "debug", "description": "Show or enable full technical trace"},
     {"command": "cancel", "description": "Cancel a pending upload"},
@@ -86,6 +96,44 @@ SUMMARY_START_MARKERS = [
     "here is what",
     "fixed:",
 ]
+
+
+def run_git_command(args: list[str], cwd: str | Path | None = None) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd or REPO_PATH),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def parse_github_repo_slug(remote_url: str) -> str | None:
+    text = remote_url.strip()
+    if not text:
+        return None
+
+    ssh_match = re.match(r"^(?:ssh://)?git@github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", text, re.IGNORECASE)
+    if ssh_match:
+        return ssh_match.group(1)
+
+    https_match = re.match(r"^https://github\.com/([^/]+/[^/]+?)(?:\.git)?$", text, re.IGNORECASE)
+    if https_match:
+        return https_match.group(1)
+
+    return None
+
+
+def resolve_github_actions_repo() -> str | None:
+    if GITHUB_ACTIONS_REPO:
+        return GITHUB_ACTIONS_REPO
+    try:
+        remote_url = run_git_command(["remote", "get-url", "origin"], cwd=REPO_PATH)
+    except Exception:
+        return None
+    return parse_github_repo_slug(remote_url)
 
 
 def telegram_request(method: str, payload: dict | None = None) -> dict:
@@ -184,6 +232,273 @@ def send_group_done_ack(chat_id: int, message: dict) -> None:
         return
     text = f'<a href="tg://user?id={user_id}">{first_name}</a> Done'
     send_message(chat_id, text, message.get("message_id"), parse_mode="HTML")
+
+
+def github_api_request(path: str, params: dict | None = None) -> dict:
+    url = f"{GITHUB_API_BASE}{path}"
+    if params:
+        query = urllib.parse.urlencode({key: str(value) for key, value in params.items()})
+        url = f"{url}?{query}"
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "telegram-copilot-bridge",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=TELEGRAM_TIMEOUT + 10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def list_github_workflows(repo_slug: str) -> list[dict]:
+    payload = github_api_request(f"/repos/{repo_slug}/actions/workflows", {"per_page": 100})
+    return payload.get("workflows") or []
+
+
+def list_github_workflow_runs(repo_slug: str, workflow_id: int | str) -> list[dict]:
+    payload = github_api_request(
+        f"/repos/{repo_slug}/actions/workflows/{workflow_id}/runs",
+        {"per_page": ACTION_RUNS_PER_WORKFLOW, "exclude_pull_requests": "true"},
+    )
+    return payload.get("workflow_runs") or []
+
+
+def get_actions_state(state: dict) -> dict:
+    return state.setdefault(
+        "github_actions",
+        {
+            "subscriptions": {},
+            "selection_cache": {},
+            "known_runs": {},
+            "initialized": False,
+        },
+    )
+
+
+def get_chat_action_subscriptions(state: dict, chat_id: int) -> list[int]:
+    actions = get_actions_state(state)
+    raw = actions.setdefault("subscriptions", {}).get(str(chat_id), [])
+    normalized: list[int] = []
+    for item in raw:
+        try:
+            normalized.append(int(item))
+        except Exception:
+            continue
+    return sorted(set(normalized))
+
+
+def set_chat_action_subscriptions(state: dict, chat_id: int, workflow_ids: list[int]) -> None:
+    with STATE_LOCK:
+        actions = get_actions_state(state)
+        subscriptions = actions.setdefault("subscriptions", {})
+        key = str(chat_id)
+        normalized = sorted(set(int(item) for item in workflow_ids))
+        if normalized:
+            subscriptions[key] = normalized
+        else:
+            subscriptions.pop(key, None)
+        save_state(state)
+
+
+def get_all_action_subscriptions(state: dict) -> dict[int, list[int]]:
+    with STATE_LOCK:
+        actions = get_actions_state(state)
+        subscriptions = actions.setdefault("subscriptions", {})
+        result: dict[int, list[int]] = {}
+        for chat_key, raw_ids in subscriptions.items():
+            try:
+                chat_id = int(chat_key)
+            except Exception:
+                continue
+            normalized: list[int] = []
+            for item in raw_ids or []:
+                try:
+                    normalized.append(int(item))
+                except Exception:
+                    continue
+            if normalized:
+                result[chat_id] = sorted(set(normalized))
+        return result
+
+
+def set_action_selection(state: dict, user_id: int, chat_id: int, repo_slug: str, workflows: list[dict]) -> None:
+    items = [
+        {
+            "id": int(workflow.get("id", 0)),
+            "name": str(workflow.get("name", "")).strip(),
+            "path": str(workflow.get("path", "")).strip(),
+        }
+        for workflow in workflows
+        if workflow.get("id")
+    ]
+    with STATE_LOCK:
+        actions = get_actions_state(state)
+        selection_cache = actions.setdefault("selection_cache", {})
+        selection_cache[f"{user_id}:{chat_id}"] = {
+            "repo": repo_slug,
+            "created_at": int(time.time()),
+            "items": items,
+        }
+        save_state(state)
+
+
+def get_action_selection(state: dict, user_id: int, chat_id: int) -> dict | None:
+    with STATE_LOCK:
+        actions = get_actions_state(state)
+        selection_cache = actions.setdefault("selection_cache", {})
+        selection = selection_cache.get(f"{user_id}:{chat_id}")
+        if not selection:
+            return None
+        created_at = int(selection.get("created_at", 0))
+        if time.time() - created_at > ACTION_SELECTION_TTL:
+            selection_cache.pop(f"{user_id}:{chat_id}", None)
+            save_state(state)
+            return None
+        return selection
+
+
+def serialize_workflow_run(run: dict) -> dict:
+    return {
+        "id": int(run.get("id", 0)),
+        "workflow_id": int(run.get("workflow_id", 0)),
+        "name": str(run.get("name", "workflow")).strip() or "workflow",
+        "run_number": int(run.get("run_number", 0) or 0),
+        "status": str(run.get("status", "unknown")).strip() or "unknown",
+        "conclusion": str(run.get("conclusion") or "").strip(),
+        "event": str(run.get("event", "unknown")).strip() or "unknown",
+        "branch": str(run.get("head_branch", "unknown")).strip() or "unknown",
+        "actor": str((run.get("actor") or {}).get("login", "unknown")).strip() or "unknown",
+        "url": str(run.get("html_url", "")).strip(),
+        "updated_at": str(run.get("updated_at", "")).strip(),
+        "created_at": str(run.get("created_at", "")).strip(),
+    }
+
+
+def is_active_workflow_run(run: dict) -> bool:
+    return str(run.get("status", "")).strip().lower() != "completed"
+
+
+def workflow_started_text(repo_slug: str, run: dict) -> str:
+    return (
+        f"GitHub Actions: {run['name']} started\n\n"
+        f"Repo: {repo_slug}\n"
+        f"Run: #{run['run_number']}\n"
+        f"Branch: {run['branch']}\n"
+        f"Event: {run['event']}\n"
+        f"By: {run['actor']}\n"
+        f"Status: {run['status']}\n"
+        f"URL: {run['url']}"
+    )
+
+
+def workflow_finished_text(repo_slug: str, run: dict) -> str:
+    conclusion = run.get("conclusion") or run.get("status") or "unknown"
+    return (
+        f"GitHub Actions: {run['name']} finished\n\n"
+        f"Repo: {repo_slug}\n"
+        f"Run: #{run['run_number']}\n"
+        f"Branch: {run['branch']}\n"
+        f"Event: {run['event']}\n"
+        f"By: {run['actor']}\n"
+        f"Result: {conclusion}\n"
+        f"URL: {run['url']}"
+    )
+
+
+def action_subscriptions_text(repo_slug: str | None, workflows: list[dict], subscribed_ids: list[int]) -> str:
+    if not subscribed_ids:
+        repo_line = f" for {repo_slug}" if repo_slug else ""
+        return f"No GitHub Actions subscriptions in this chat{repo_line}."
+
+    workflow_by_id = {int(workflow.get("id", 0)): workflow for workflow in workflows if workflow.get("id")}
+    lines = [f"GitHub Actions subscriptions for this chat ({repo_slug or 'repo unknown'}):", ""]
+    for workflow_id in subscribed_ids:
+        workflow = workflow_by_id.get(workflow_id)
+        if workflow:
+            name = str(workflow.get("name", "workflow")).strip() or "workflow"
+            path = Path(str(workflow.get("path", ""))).name or "unknown"
+            lines.append(f"- {name} ({path})")
+        else:
+            lines.append(f"- Workflow #{workflow_id}")
+    return "\n".join(lines)
+
+
+def actions_list_text(repo_slug: str, workflows: list[dict], subscribed_ids: list[int]) -> str:
+    if not workflows:
+        return f"No GitHub Actions workflows were found for {repo_slug}."
+
+    lines = [f"Available GitHub Actions for {repo_slug}:", ""]
+    for index, workflow in enumerate(workflows, start=1):
+        workflow_id = int(workflow.get("id", 0))
+        name = str(workflow.get("name", "workflow")).strip() or "workflow"
+        path = Path(str(workflow.get("path", ""))).name or "unknown"
+        watching = " [watching here]" if workflow_id in subscribed_ids else ""
+        lines.append(f"{index}. {name}{watching}")
+        lines.append(f"   {path}")
+    lines.extend([
+        "",
+        "Use /watch <number> to subscribe this chat.",
+        "Use /subscriptions to inspect current subscriptions.",
+        "Use /unwatch <number> or /unwatch all to stop notifications.",
+    ])
+    return "\n".join(lines)
+
+
+def parse_command_argument(text: str) -> str:
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    return parts[1].strip()
+
+
+def resolve_workflow_selection(argument: str, selection: dict | None, workflows: list[dict]) -> tuple[dict | None, str | None]:
+    query = argument.strip()
+    if not query:
+        return None, "Send /watch <number> or /unwatch <number>. Use /actions to see the current list."
+
+    if query.lower() == "all":
+        return {"id": -1, "name": "all", "path": "all"}, None
+
+    workflow_by_id = {int(workflow.get("id", 0)): workflow for workflow in workflows if workflow.get("id")}
+    if query.isdigit():
+        if selection:
+            items = selection.get("items") or []
+            index = int(query) - 1
+            if 0 <= index < len(items):
+                item_id = int(items[index].get("id", 0))
+                workflow = workflow_by_id.get(item_id)
+                if workflow:
+                    return workflow, None
+                return None, "That workflow is no longer available. Run /actions again."
+        workflow = workflow_by_id.get(int(query))
+        if workflow:
+            return workflow, None
+
+    lowered = query.casefold()
+    exact_matches: list[dict] = []
+    fuzzy_matches: list[dict] = []
+    for workflow in workflows:
+        name = str(workflow.get("name", "")).strip()
+        filename = Path(str(workflow.get("path", ""))).name
+        workflow_id = str(workflow.get("id", "")).strip()
+        candidates = [name.casefold(), filename.casefold(), workflow_id.casefold()]
+        if lowered in candidates:
+            exact_matches.append(workflow)
+            continue
+        if lowered in name.casefold() or lowered in filename.casefold():
+            fuzzy_matches.append(workflow)
+
+    if len(exact_matches) == 1:
+        return exact_matches[0], None
+    if len(fuzzy_matches) == 1:
+        return fuzzy_matches[0], None
+    if len(exact_matches) > 1 or len(fuzzy_matches) > 1:
+        return None, "That matches multiple workflows. Use /actions and pick the number instead."
+
+    return None, "Workflow not found. Use /actions to list available workflows."
 
 
 def get_active_request(user_id: int) -> dict | None:
@@ -512,6 +827,7 @@ def help_text() -> str:
         f"Commands:\n{command_lines}\n\n"
         "Any plain text message is sent to Copilot in the configured repository.\n"
         "Telegram shows a human-readable summary by default. Use /debug if you want the full technical trace.\n\n"
+        "GitHub Actions subscriptions are managed per chat: use /actions, then /watch <number>.\n\n"
         "In group chats, the bot responds only to allowed users who mention @"
         f"{BOT_USERNAME}, use a command like /status@{BOT_USERNAME}, or reply directly to the bot."
     )
@@ -530,15 +846,150 @@ def status_text(state: dict, user_id: int) -> str:
     except Exception:
         branch = "unknown"
     session_state = get_session_state(state, user_id)
+    repo_slug = resolve_github_actions_repo() or "not configured"
+    subscriptions = get_all_action_subscriptions(state)
+    chat_count = len(subscriptions)
     return (
         "Bridge is running\n\n"
         f"Repo: {REPO_PATH}\n"
         f"Branch: {branch}\n"
+        f"GitHub Actions repo: {repo_slug}\n"
+        f"Action subscription chats: {chat_count}\n"
         f"Whitelisted users: {len(ALLOWED_USER_IDS)}\n"
         f"Session state: {'continuing' if session_state.get('has_session') else 'new'}\n"
         f"Active request: {'yes' if get_active_request(user_id) else 'no'}\n"
         f"Upload tool: {'configured' if UPLOAD_TOOL.exists() else 'missing'}"
     )
+
+
+def fetch_actions_repo_and_workflows() -> tuple[str | None, list[dict], str | None]:
+    repo_slug = resolve_github_actions_repo()
+    if not repo_slug:
+        return None, [], (
+            "GitHub Actions repo is not configured. Set GITHUB_ACTIONS_REPO=owner/repo, "
+            "or point REPO_PATH at a GitHub clone with an origin remote."
+        )
+    try:
+        workflows = list_github_workflows(repo_slug)
+    except Exception as error:
+        return repo_slug, [], f"Failed to load GitHub Actions workflows: {error}"
+    return repo_slug, workflows, None
+
+
+def handle_actions_command(message: dict, state: dict) -> None:
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    repo_slug, workflows, error = fetch_actions_repo_and_workflows()
+    if error:
+        send_message(chat_id, error)
+        return
+    set_action_selection(state, user_id, chat_id, repo_slug or "", workflows)
+    subscribed_ids = get_chat_action_subscriptions(state, chat_id)
+    send_text_blocks(chat_id, actions_list_text(repo_slug or "unknown", workflows, subscribed_ids))
+
+
+def handle_subscriptions_command(message: dict, state: dict) -> None:
+    chat_id = message["chat"]["id"]
+    repo_slug, workflows, error = fetch_actions_repo_and_workflows()
+    if error and not get_chat_action_subscriptions(state, chat_id):
+        send_message(chat_id, error)
+        return
+    send_text_blocks(
+        chat_id,
+        action_subscriptions_text(repo_slug, workflows, get_chat_action_subscriptions(state, chat_id)),
+    )
+
+
+def handle_watch_command(message: dict, state: dict) -> None:
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    argument = parse_command_argument(get_message_text(message))
+    repo_slug, workflows, error = fetch_actions_repo_and_workflows()
+    if error:
+        send_message(chat_id, error)
+        return
+
+    selection = get_action_selection(state, user_id, chat_id)
+    workflow, resolution_error = resolve_workflow_selection(argument, selection, workflows)
+    if resolution_error:
+        send_message(chat_id, resolution_error)
+        return
+    if not workflow or workflow.get("id") == -1:
+        send_message(chat_id, "Use /watch <number> to subscribe one workflow at a time.")
+        return
+
+    workflow_id = int(workflow.get("id", 0))
+    subscribed_ids = get_chat_action_subscriptions(state, chat_id)
+    if workflow_id in subscribed_ids:
+        send_message(chat_id, "This chat is already subscribed to that workflow.")
+        return
+
+    subscribed_ids.append(workflow_id)
+    set_chat_action_subscriptions(state, chat_id, subscribed_ids)
+
+    status_note = "Notifications will be posted here when it starts and when it finishes."
+    try:
+        runs = list_github_workflow_runs(repo_slug or "", workflow_id)
+    except Exception:
+        runs = []
+    if runs:
+        latest = serialize_workflow_run(runs[0])
+        if is_active_workflow_run(latest):
+            status_note = (
+                "Notifications will be posted here. "
+                f"Current latest run is already active: #{latest['run_number']} ({latest['status']})."
+            )
+        else:
+            result = latest.get("conclusion") or latest.get("status") or "unknown"
+            status_note = (
+                "Notifications will be posted here. "
+                f"Latest completed run: #{latest['run_number']} ({result})."
+            )
+
+    send_message(
+        chat_id,
+        (
+            f"Subscribed this chat to {workflow.get('name', 'workflow')}.\n\n"
+            f"Repo: {repo_slug}\n"
+            f"Workflow file: {Path(str(workflow.get('path', ''))).name or 'unknown'}\n"
+            f"{status_note}"
+        ),
+    )
+
+
+def handle_unwatch_command(message: dict, state: dict) -> None:
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    argument = parse_command_argument(get_message_text(message))
+    subscribed_ids = get_chat_action_subscriptions(state, chat_id)
+    if not subscribed_ids:
+        send_message(chat_id, "This chat has no GitHub Actions subscriptions.")
+        return
+
+    repo_slug, workflows, error = fetch_actions_repo_and_workflows()
+    if error:
+        workflows = []
+    selection = get_action_selection(state, user_id, chat_id)
+    workflow, resolution_error = resolve_workflow_selection(argument, selection, workflows)
+    if resolution_error:
+        send_message(chat_id, resolution_error)
+        return
+    if not workflow:
+        send_message(chat_id, "Workflow not found. Use /subscriptions or /actions first.")
+        return
+
+    if int(workflow.get("id", 0)) == -1:
+        set_chat_action_subscriptions(state, chat_id, [])
+        send_message(chat_id, "Removed all GitHub Actions subscriptions from this chat.")
+        return
+
+    workflow_id = int(workflow.get("id", 0))
+    if workflow_id not in subscribed_ids:
+        send_message(chat_id, "This chat is not subscribed to that workflow.")
+        return
+
+    set_chat_action_subscriptions(state, chat_id, [item for item in subscribed_ids if item != workflow_id])
+    send_message(chat_id, f"Unsubscribed this chat from {workflow.get('name', 'workflow')}.")
 
 
 def upload_help_text() -> str:
@@ -868,6 +1319,22 @@ def handle_message(message: dict, state: dict) -> None:
         send_message(chat_id, help_text())
         send_group_done_ack(chat_id, message)
         return
+    if command == "/actions":
+        handle_actions_command(message, state)
+        send_group_done_ack(chat_id, message)
+        return
+    if command == "/subscriptions":
+        handle_subscriptions_command(message, state)
+        send_group_done_ack(chat_id, message)
+        return
+    if command == "/watch":
+        handle_watch_command(message, state)
+        send_group_done_ack(chat_id, message)
+        return
+    if command == "/unwatch":
+        handle_unwatch_command(message, state)
+        send_group_done_ack(chat_id, message)
+        return
     if command == "/debug":
         handle_debug_command(message, state)
         return
@@ -973,11 +1440,112 @@ def handle_message(message: dict, state: dict) -> None:
     worker.start()
 
 
+def poll_github_action_updates(state: dict) -> None:
+    while True:
+        try:
+            repo_slug = resolve_github_actions_repo()
+            subscriptions_by_chat = get_all_action_subscriptions(state)
+            subscribed_workflow_ids = sorted({
+                workflow_id
+                for workflow_ids in subscriptions_by_chat.values()
+                for workflow_id in workflow_ids
+            })
+
+            if not repo_slug or not subscribed_workflow_ids:
+                time.sleep(GITHUB_POLL_INTERVAL)
+                continue
+
+            notifications: list[tuple[int, str]] = []
+            changed = False
+
+            with STATE_LOCK:
+                actions = get_actions_state(state)
+                known_runs = actions.setdefault("known_runs", {})
+                initialized = bool(actions.get("initialized"))
+
+                for workflow_id in subscribed_workflow_ids:
+                    runs = list_github_workflow_runs(repo_slug, workflow_id)
+                    for raw_run in runs:
+                        run = serialize_workflow_run(raw_run)
+                        if not run["id"] or run["workflow_id"] != workflow_id:
+                            continue
+
+                        run_key = str(run["id"])
+                        previous = known_runs.get(run_key)
+                        current_status = run.get("status", "unknown")
+                        current_conclusion = run.get("conclusion", "")
+
+                        if previous is None:
+                            known_runs[run_key] = run
+                            changed = True
+                            if initialized and is_active_workflow_run(run):
+                                for chat_id, workflow_ids in subscriptions_by_chat.items():
+                                    if workflow_id in workflow_ids:
+                                        notifications.append((chat_id, workflow_started_text(repo_slug, run)))
+                            continue
+
+                        previous_status = str(previous.get("status", "unknown"))
+                        previous_conclusion = str(previous.get("conclusion", ""))
+                        if previous_status != current_status or previous_conclusion != current_conclusion:
+                            known_runs[run_key] = run
+                            changed = True
+                            if previous_status != "completed" and current_status == "completed":
+                                for chat_id, workflow_ids in subscriptions_by_chat.items():
+                                    if workflow_id in workflow_ids:
+                                        notifications.append((chat_id, workflow_finished_text(repo_slug, run)))
+
+                known_ids = {str(run_id) for run_id in known_runs.keys()}
+                active_known: dict[str, dict] = {}
+                for run_key in sorted(known_ids, key=int, reverse=True):
+                    entry = known_runs.get(run_key)
+                    if not entry:
+                        continue
+                    workflow_id = int(entry.get("workflow_id", 0) or 0)
+                    if workflow_id not in subscribed_workflow_ids:
+                        changed = True
+                        continue
+                    per_workflow_count = sum(
+                        1 for existing in active_known.values()
+                        if int(existing.get("workflow_id", 0) or 0) == workflow_id
+                    )
+                    if per_workflow_count >= ACTION_RUNS_PER_WORKFLOW:
+                        changed = True
+                        continue
+                    active_known[run_key] = entry
+
+                if len(active_known) != len(known_runs):
+                    known_runs.clear()
+                    known_runs.update(active_known)
+                    changed = True
+
+                if not initialized:
+                    actions["initialized"] = True
+                    changed = True
+
+                if changed:
+                    save_state(state)
+
+            for chat_id, text in notifications:
+                try:
+                    send_text_blocks(chat_id, text)
+                except Exception as error:
+                    print(
+                        f"bridge warning: failed to send GitHub Actions notification to chat {chat_id}: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        except Exception as error:
+            print(f"bridge warning: GitHub Actions polling failed: {error}", file=sys.stderr, flush=True)
+
+        time.sleep(GITHUB_POLL_INTERVAL)
+
+
 def main() -> int:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     sync_bot_commands_safe()
     state = load_state()
+    threading.Thread(target=poll_github_action_updates, args=(state,), daemon=True).start()
     while True:
         try:
             updates = telegram_request(

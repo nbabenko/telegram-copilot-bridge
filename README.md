@@ -11,6 +11,7 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
 - Returns a human-readable summary by default and exposes the full technical trace through `/debug`
 - Includes replied-to Telegram message text and attachments as Copilot context
 - Accepts `/upload`, asks for a storage name, and uploads Telegram media without overwriting existing names
+- Lists GitHub Actions workflows and lets each chat subscribe to start and finish notifications
 
 ## Requirements
 
@@ -22,6 +23,7 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
 - At least one Telegram numeric user ID to whitelist
 - Object storage credentials for uploads
 - `ffmpeg` if `.mov` inputs should be converted to MP4 automatically
+- Optional GitHub token if the watched repository is private or you want higher API rate limits
 
 ## Files
 
@@ -41,6 +43,9 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
    - set `REPO_PATH`
   - set `UPLOAD_DIR` to a folder inside the target repository if you want uploaded files to be readable by Copilot without extra path permissions
   - set the `OBJECT_STORAGE_*` variables if `/upload` should work
+  - optionally set `GITHUB_ACTIONS_REPO=owner/repo`; if omitted, the bridge derives it from the `origin` remote of `REPO_PATH`
+  - optionally set `GITHUB_TOKEN` for private repositories or higher rate limits
+  - optionally set `GITHUB_POLL_INTERVAL` to control how often workflow runs are checked
 4. Install the upload-helper dependency:
 
 ```bash
@@ -64,11 +69,34 @@ python3 bot.py
 - `/help` - show help
 - `/new` - start a fresh Copilot thread for the current Telegram account
 - `/status` - show repo and session status
+- `/actions` - list GitHub Actions workflows for the configured repository
+- `/subscriptions` - show the current chat's workflow subscriptions
+- `/watch <number|name>` - subscribe the current chat to a workflow
+- `/unwatch <number|name|all>` - stop workflow notifications in the current chat
 - `/debug` - show the latest full technical trace or attach to the current request trace
 - `/upload` - upload Telegram media to object storage after you provide a name
 - `/cancel` - cancel a pending upload
 - `/copilot <prompt>` - send an explicit prompt
 - plain text message - send that text to Copilot
+
+## GitHub Actions Notifications
+
+Workflow subscriptions are scoped per chat.
+
+- in a private chat, notifications come back to that direct message
+- in a group chat, notifications are posted into that group
+- any whitelisted user can manage subscriptions for the chat they are currently in
+
+Recommended workflow:
+
+1. Run `/actions` to list available workflows and their numbers.
+2. Run `/watch <number>` to subscribe the current chat.
+3. Run `/subscriptions` to review current watches.
+4. Run `/unwatch <number>` or `/unwatch all` to stop notifications.
+
+The bridge polls GitHub and sends a message when a watched workflow run first appears as active and when that run reaches `completed` with its final result.
+
+For a fine-grained personal access token, grant repository access to the watched repository and set `Actions: Read-only`.
 
 ## Output Modes
 
