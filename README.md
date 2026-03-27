@@ -44,7 +44,7 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
   - set `UPLOAD_DIR` to a folder inside the target repository if you want uploaded files to be readable by Copilot without extra path permissions
   - set the `OBJECT_STORAGE_*` variables if `/upload` should work
   - optionally set `GITHUB_ACTIONS_REPO=owner/repo`; if omitted, the bridge derives it from the `origin` remote of `REPO_PATH`
-  - optionally set `GITHUB_TOKEN` for private repositories or higher rate limits
+  - optionally set `GITHUB_ACTIONS_TOKEN` for private repositories or higher rate limits
   - optionally set `GITHUB_POLL_INTERVAL` to control how often workflow runs are checked
 4. Install the upload-helper dependency:
 
@@ -97,6 +97,8 @@ Recommended workflow:
 The bridge polls GitHub and sends a message when a watched workflow run first appears as active and when that run reaches `completed` with its final result.
 
 For a fine-grained personal access token, grant repository access to the watched repository and set `Actions: Read-only`.
+
+Use `GITHUB_ACTIONS_TOKEN` for the workflow watcher. Do not reuse that token as the Copilot CLI auth token: the bridge strips the Actions token from the Copilot subprocess to avoid authentication conflicts.
 
 ## Output Modes
 

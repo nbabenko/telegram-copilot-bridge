@@ -50,7 +50,8 @@ STREAM_FLUSH_MIN_PARAGRAPH_LEN = 1200
 UPLOAD_TOOL = BASE_DIR / "scripts" / "upload-media.mjs"
 DEBUG_TRACE_MAX_CHARS = 400000
 GITHUB_API_BASE = "https://api.github.com"
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_ACTIONS_TOKEN = os.environ.get("GITHUB_ACTIONS_TOKEN", "").strip()
+GITHUB_API_TOKEN = GITHUB_ACTIONS_TOKEN or os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_ACTIONS_REPO = os.environ.get("GITHUB_ACTIONS_REPO", "").strip()
 GITHUB_POLL_INTERVAL = max(15, int(os.environ.get("GITHUB_POLL_INTERVAL", "45")))
 ACTION_SELECTION_TTL = 900
@@ -245,8 +246,8 @@ def github_api_request(path: str, params: dict | None = None) -> dict:
         "User-Agent": "telegram-copilot-bridge",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    if GITHUB_API_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_API_TOKEN}"
 
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=TELEGRAM_TIMEOUT + 10) as response:
@@ -1044,6 +1045,14 @@ def run_upload_tool(local_path: Path, upload_name: str) -> tuple[bool, str]:
     return True, upload_result_text(parsed)
 
 
+def build_copilot_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("GITHUB_ACTIONS_TOKEN", None)
+    if GITHUB_API_TOKEN and env.get("GITHUB_TOKEN", "").strip() == GITHUB_API_TOKEN:
+        env.pop("GITHUB_TOKEN", None)
+    return env
+
+
 def begin_upload_from_message(state: dict, user_id: int, chat_id: int, source_message: dict) -> None:
     attachment = extract_attachment(source_message)
     if not attachment:
@@ -1150,7 +1159,7 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        env=os.environ.copy(),
+        env=build_copilot_env(),
     )
     deadline = time.monotonic() + COPILOT_TIMEOUT
     buffer: list[str] = []
