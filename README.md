@@ -1,6 +1,6 @@
 # Telegram Copilot Bridge
 
-Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for a specific local repository and sends the full raw CLI output back to Telegram.
+Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for a specific local repository and sends a cleaned human-readable summary back to Telegram by default.
 
 ## What It Does
 
@@ -8,7 +8,7 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
 - Whitelists specific Telegram user IDs
 - Runs `copilot -p` inside a configured repository
 - Continues Copilot context per Telegram user
-- Returns full Copilot CLI output as plain Telegram messages
+- Returns a human-readable summary by default and exposes the full technical trace through `/debug`
 - Includes replied-to Telegram message text and attachments as Copilot context
 - Accepts `/upload`, asks for a storage name, and uploads Telegram media without overwriting existing names
 
@@ -64,11 +64,22 @@ python3 bot.py
 - `/help` - show help
 - `/new` - start a fresh Copilot thread for the current Telegram account
 - `/status` - show repo and session status
+- `/debug` - show the latest full technical trace or attach to the current request trace
 - `/upload` - upload Telegram media to object storage after you provide a name
 - `/cancel` - cancel a pending upload
 - `/copilot <prompt>` - send an explicit prompt
 - plain text message - send that text to Copilot
 
+## Output Modes
+
+By default, Telegram receives a cleaned user-facing summary instead of the raw tool-by-tool Copilot trace.
+
+Use `/debug` in one of two ways:
+
+- if a request is currently running, `/debug` replays the full technical trace from the start and keeps streaming technical details until that request finishes
+- if no request is running, `/debug` returns the full technical trace for your latest completed reply
+
+This keeps ordinary chats readable while preserving a way to inspect the raw execution details when needed.
 ## File Uploads
 
 The bridge can process Telegram attachments such as documents and photos.

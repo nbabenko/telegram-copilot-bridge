@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -47,14 +48,43 @@ STREAM_FLUSH_MAX_LEN = 3600
 STREAM_FLUSH_INTERVAL = 4.0
 STREAM_FLUSH_MIN_PARAGRAPH_LEN = 1200
 UPLOAD_TOOL = BASE_DIR / "scripts" / "upload-media.mjs"
+DEBUG_TRACE_MAX_CHARS = 400000
 BOT_COMMANDS = [
     {"command": "start", "description": "Show help and quick start"},
     {"command": "help", "description": "Show help and commands"},
     {"command": "new", "description": "Start a fresh Copilot thread"},
     {"command": "status", "description": "Show bridge and session status"},
     {"command": "upload", "description": "Upload Telegram media to object storage"},
+    {"command": "debug", "description": "Show or enable full technical trace"},
     {"command": "cancel", "description": "Cancel a pending upload"},
     {"command": "copilot", "description": "Send an explicit prompt to Copilot"},
+]
+STATE_LOCK = threading.RLock()
+REQUESTS_LOCK = threading.RLock()
+ACTIVE_REQUESTS: dict[int, dict] = {}
+
+TECHNICAL_LINE_PATTERNS = [
+    re.compile(r"^\s*[●◦○◆].*"),
+    re.compile(r"^\s*[│└].*"),
+    re.compile(r"^\s*Total usage est:.*", re.IGNORECASE),
+    re.compile(r"^\s*API time spent:.*", re.IGNORECASE),
+    re.compile(r"^\s*Total session time:.*", re.IGNORECASE),
+    re.compile(r"^\s*Total code changes:.*", re.IGNORECASE),
+    re.compile(r"^\s*Breakdown by AI model:.*", re.IGNORECASE),
+    re.compile(r"^\s*claude-[\w.-]+.*", re.IGNORECASE),
+    re.compile(r"^\s*gpt-[\w.-]+.*", re.IGNORECASE),
+    re.compile(r"^\s*Agent started in background.*", re.IGNORECASE),
+    re.compile(r"^\s*Completed\s*$", re.IGNORECASE),
+]
+
+SUMMARY_START_MARKERS = [
+    "готово",
+    "ось що",
+    "done.",
+    "done!",
+    "here's what",
+    "here is what",
+    "fixed:",
 ]
 
 
@@ -154,6 +184,105 @@ def send_group_done_ack(chat_id: int, message: dict) -> None:
         return
     text = f'<a href="tg://user?id={user_id}">{first_name}</a> Done'
     send_message(chat_id, text, message.get("message_id"), parse_mode="HTML")
+
+
+def get_active_request(user_id: int) -> dict | None:
+    with REQUESTS_LOCK:
+        return ACTIVE_REQUESTS.get(user_id)
+
+
+def start_active_request(user_id: int, chat_id: int, message: dict) -> dict:
+    request = {
+        "chat_id": chat_id,
+        "message": message,
+        "raw_blocks": [],
+        "debug_enabled": False,
+    }
+    with REQUESTS_LOCK:
+        ACTIVE_REQUESTS[user_id] = request
+    return request
+
+
+def append_active_request_block(user_id: int, block: str) -> tuple[bool, int | None]:
+    with REQUESTS_LOCK:
+        request = ACTIVE_REQUESTS.get(user_id)
+        if request is None:
+            return False, None
+        request["raw_blocks"].append(block)
+        return bool(request.get("debug_enabled")), request.get("chat_id")
+
+
+def enable_debug_for_active_request(user_id: int) -> dict | None:
+    with REQUESTS_LOCK:
+        request = ACTIVE_REQUESTS.get(user_id)
+        if request is None:
+            return None
+        request["debug_enabled"] = True
+        return {
+            "chat_id": request.get("chat_id"),
+            "raw_blocks": list(request.get("raw_blocks") or []),
+        }
+
+
+def finish_active_request(user_id: int) -> dict | None:
+    with REQUESTS_LOCK:
+        return ACTIVE_REQUESTS.pop(user_id, None)
+
+
+def strip_ansi_sequences(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
+
+
+def is_technical_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return any(pattern.match(stripped) for pattern in TECHNICAL_LINE_PATTERNS)
+
+
+def build_user_facing_text(raw_text: str) -> str:
+    cleaned_lines: list[str] = []
+    for line in strip_ansi_sequences(raw_text).splitlines():
+        if is_technical_line(line):
+            continue
+        cleaned_lines.append(line.rstrip())
+
+    while cleaned_lines and not cleaned_lines[0].strip():
+        cleaned_lines.pop(0)
+    while cleaned_lines and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
+
+    if not cleaned_lines:
+        return "Task finished. Use /debug to view the technical trace."
+
+    start_index = 0
+    for index, line in enumerate(cleaned_lines):
+        lowered = line.lower()
+        if any(marker in lowered for marker in SUMMARY_START_MARKERS):
+            start_index = index
+
+    summary_lines = cleaned_lines[start_index:]
+    collapsed: list[str] = []
+    previous_blank = False
+    for line in summary_lines:
+        is_blank = not line.strip()
+        if is_blank and previous_blank:
+            continue
+        collapsed.append(line)
+        previous_blank = is_blank
+
+    text = "\n".join(collapsed).strip()
+    return text or "Task finished. Use /debug to view the technical trace."
+
+
+def trim_debug_text(text: str) -> str:
+    if len(text) <= DEBUG_TRACE_MAX_CHARS:
+        return text
+    omitted = len(text) - DEBUG_TRACE_MAX_CHARS
+    return (
+        f"[debug trace truncated, omitted {omitted} earlier characters]\n\n"
+        f"{text[-DEBUG_TRACE_MAX_CHARS:]}"
+    )
 
 
 def format_user_label(user: dict) -> str:
@@ -308,16 +437,18 @@ def extract_attachment(message: dict) -> tuple[str, str | None] | None:
 
 
 def load_state() -> dict:
-    if not STATE_PATH.exists():
-        return {"offset": 0, "sessions": {}}
-    try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"offset": 0, "sessions": {}}
+    with STATE_LOCK:
+        if not STATE_PATH.exists():
+            return {"offset": 0, "sessions": {}}
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {"offset": 0, "sessions": {}}
 
 
 def save_state(state: dict) -> None:
-    STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
+    with STATE_LOCK:
+        STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
 
 
 def get_session_state(state: dict, user_id: int) -> dict:
@@ -326,6 +457,17 @@ def get_session_state(state: dict, user_id: int) -> dict:
     if session_key not in sessions:
         sessions[session_key] = {"has_session": False}
     return sessions[session_key]
+
+
+def get_latest_debug_trace(state: dict, user_id: int) -> str | None:
+    latest = state.setdefault("latest_debug_traces", {})
+    return latest.get(str(user_id))
+
+
+def set_latest_debug_trace(state: dict, user_id: int, raw_text: str) -> None:
+    latest = state.setdefault("latest_debug_traces", {})
+    latest[str(user_id)] = trim_debug_text(raw_text)
+    save_state(state)
 
 
 def get_upload_session(state: dict, user_id: int) -> dict | None:
@@ -369,7 +511,7 @@ def help_text() -> str:
         f"Repo: {REPO_PATH}\n\n"
         f"Commands:\n{command_lines}\n\n"
         "Any plain text message is sent to Copilot in the configured repository.\n"
-        "Telegram receives the full raw Copilot CLI output, not only the final summary.\n\n"
+        "Telegram shows a human-readable summary by default. Use /debug if you want the full technical trace.\n\n"
         "In group chats, the bot responds only to allowed users who mention @"
         f"{BOT_USERNAME}, use a command like /status@{BOT_USERNAME}, or reply directly to the bot."
     )
@@ -394,6 +536,7 @@ def status_text(state: dict, user_id: int) -> str:
         f"Branch: {branch}\n"
         f"Whitelisted users: {len(ALLOWED_USER_IDS)}\n"
         f"Session state: {'continuing' if session_state.get('has_session') else 'new'}\n"
+        f"Active request: {'yes' if get_active_request(user_id) else 'no'}\n"
         f"Upload tool: {'configured' if UPLOAD_TOOL.exists() else 'missing'}"
     )
 
@@ -489,7 +632,6 @@ def begin_upload_from_message(state: dict, user_id: int, chat_id: int, source_me
 def handle_pending_upload(message: dict, state: dict, upload_session: dict) -> bool:
     chat_id = message["chat"]["id"]
     user_id = message["from"]["id"]
-    message_id = message["message_id"]
     text = get_message_text(message).strip()
     command = normalize_command_token(text.split()[0]) if text.startswith("/") else ""
 
@@ -640,6 +782,64 @@ def default_reply_prompt() -> str:
     return "Review the referenced Telegram message and respond to it."
 
 
+def handle_debug_command(message: dict, state: dict) -> None:
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    active_request = enable_debug_for_active_request(user_id)
+    if active_request and active_request.get("chat_id") == chat_id:
+        raw_blocks = active_request.get("raw_blocks") or []
+        if raw_blocks:
+            send_message(chat_id, "Debug mode enabled for the current request. Sending the technical trace collected so far.")
+            for block in raw_blocks:
+                send_text_blocks(chat_id, block)
+        else:
+            send_message(chat_id, "Debug mode enabled for the current request. Technical details will appear as they are produced.")
+        return
+
+    latest_trace = get_latest_debug_trace(state, user_id)
+    if latest_trace:
+        send_message(chat_id, "Latest technical trace:")
+        send_text_blocks(chat_id, latest_trace)
+        return
+
+    send_message(chat_id, "No active or recent request is available for debug.")
+
+
+def process_copilot_request(state: dict, message: dict, prompt: str, continue_session: bool, user_id: int, chat_id: int) -> None:
+    request = start_active_request(user_id, chat_id, message)
+    send_typing(chat_id)
+    send_message(chat_id, "Working...")
+
+    def on_block(block: str) -> None:
+        debug_enabled, debug_chat_id = append_active_request_block(user_id, block)
+        if debug_enabled and debug_chat_id is not None:
+            send_text_blocks(debug_chat_id, block)
+
+    success, sent_any, result = stream_copilot(prompt, continue_session, on_block)
+    completed_request = finish_active_request(user_id) or request
+    raw_text = "\n\n".join(completed_request.get("raw_blocks") or [])
+    if raw_text:
+        set_latest_debug_trace(state, user_id, raw_text)
+
+    if success:
+        session_state = get_session_state(state, user_id)
+        session_state["has_session"] = True
+        save_state(state)
+        summary_text = build_user_facing_text(raw_text)
+        if summary_text:
+            send_text_blocks(chat_id, summary_text)
+        elif not sent_any:
+            send_message(chat_id, "Task finished.")
+        send_group_done_ack(chat_id, message)
+        return
+
+    if result:
+        send_message(chat_id, "The task failed. Use /debug to see the technical details.")
+        if completed_request.get("debug_enabled"):
+            send_text_blocks(chat_id, result)
+    send_group_done_ack(chat_id, message)
+
+
 def handle_message(message: dict, state: dict) -> None:
     chat_id = message["chat"]["id"]
     chat_type = message["chat"].get("type", "private")
@@ -668,11 +868,17 @@ def handle_message(message: dict, state: dict) -> None:
         send_message(chat_id, help_text())
         send_group_done_ack(chat_id, message)
         return
+    if command == "/debug":
+        handle_debug_command(message, state)
+        return
     if command == "/cancel":
         send_message(chat_id, "There is no pending upload to cancel.")
         send_group_done_ack(chat_id, message)
         return
     if command == "/new":
+        if get_active_request(user_id):
+            send_message(chat_id, "A request is still running. Wait for it to finish, or use /debug to watch the technical trace.")
+            return
         session_state["has_session"] = False
         save_state(state)
         send_message(chat_id, "Started a fresh Copilot thread for your account.")
@@ -695,6 +901,10 @@ def handle_message(message: dict, state: dict) -> None:
             set_upload_session(state, user_id, {"chat_id": chat_id, "stage": "awaiting_media"})
             send_message(chat_id, upload_help_text())
         send_group_done_ack(chat_id, message)
+        return
+
+    if get_active_request(user_id):
+        send_message(chat_id, "A request is already running. Wait for it to finish, or use /debug to watch the full technical trace.")
         return
 
     attachment_path = None
@@ -748,24 +958,19 @@ def handle_message(message: dict, state: dict) -> None:
         referenced_context = build_referenced_message_context(referenced_message, referenced_attachment_path)
         prompt = f"{prompt}\n\n{append_referenced_download_warning(referenced_context, referenced_attachment_warning)}"
 
-    send_typing(chat_id)
-    send_message(chat_id, "Working...")
-    success, sent_any, result = stream_copilot(
-        prompt,
-        bool(session_state.get("has_session")),
-        lambda block: send_text_blocks(chat_id, block),
+    worker = threading.Thread(
+        target=process_copilot_request,
+        args=(
+            state,
+            message,
+            prompt,
+            bool(session_state.get("has_session")),
+            user_id,
+            chat_id,
+        ),
+        daemon=True,
     )
-    if success:
-        session_state["has_session"] = True
-        save_state(state)
-        if not sent_any:
-            send_message(chat_id, "Copilot returned no text.")
-        send_group_done_ack(chat_id, message)
-        return
-
-    if result:
-        send_message(chat_id, f"Copilot failed:\n\n{result}")
-    send_group_done_ack(chat_id, message)
+    worker.start()
 
 
 def main() -> int:
