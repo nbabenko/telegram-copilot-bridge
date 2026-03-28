@@ -94,7 +94,7 @@ Recommended workflow:
 3. Run `/subscriptions` to review current watches.
 4. Run `/unwatch <number>` or `/unwatch all` to stop notifications.
 
-The bridge polls GitHub and sends a message when a watched workflow run first appears as active and when that run reaches `completed` with its final result.
+The bridge polls GitHub and sends a message when a watched workflow run first appears as active and when that run reaches `completed` with its final result. Notifications include the workflow name and GitHub run title, while the start message stays intentionally concise.
 
 For a fine-grained personal access token, grant repository access to the watched repository and set `Actions: Read-only`.
 

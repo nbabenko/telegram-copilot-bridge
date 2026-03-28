@@ -362,10 +362,16 @@ def get_action_selection(state: dict, user_id: int, chat_id: int) -> dict | None
 
 
 def serialize_workflow_run(run: dict) -> dict:
+    run_title = str(run.get("display_title") or "").strip()
+    if not run_title:
+        run_number = int(run.get("run_number", 0) or 0)
+        fallback_name = str(run.get("name", "workflow")).strip() or "workflow"
+        run_title = f"{fallback_name} #{run_number}" if run_number else fallback_name
     return {
         "id": int(run.get("id", 0)),
         "workflow_id": int(run.get("workflow_id", 0)),
         "name": str(run.get("name", "workflow")).strip() or "workflow",
+        "run_title": run_title,
         "run_number": int(run.get("run_number", 0) or 0),
         "status": str(run.get("status", "unknown")).strip() or "unknown",
         "conclusion": str(run.get("conclusion") or "").strip(),
@@ -386,11 +392,8 @@ def workflow_started_text(repo_slug: str, run: dict) -> str:
     return (
         f"GitHub Actions: {run['name']} started\n\n"
         f"Repo: {repo_slug}\n"
-        f"Run: #{run['run_number']}\n"
-        f"Branch: {run['branch']}\n"
-        f"Event: {run['event']}\n"
+        f"Run: {run['run_title']}\n"
         f"By: {run['actor']}\n"
-        f"Status: {run['status']}\n"
         f"URL: {run['url']}"
     )
 
@@ -400,9 +403,7 @@ def workflow_finished_text(repo_slug: str, run: dict) -> str:
     return (
         f"GitHub Actions: {run['name']} finished\n\n"
         f"Repo: {repo_slug}\n"
-        f"Run: #{run['run_number']}\n"
-        f"Branch: {run['branch']}\n"
-        f"Event: {run['event']}\n"
+        f"Run: {run['run_title']}\n"
         f"By: {run['actor']}\n"
         f"Result: {conclusion}\n"
         f"URL: {run['url']}"
