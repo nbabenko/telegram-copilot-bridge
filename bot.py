@@ -391,8 +391,8 @@ def is_active_workflow_run(run: dict) -> bool:
 def workflow_started_text(repo_slug: str, run: dict) -> str:
     return (
         f"GitHub Actions: {run['name']} started\n\n"
+        f"Run: {run['run_title']}\n\n"
         f"Repo: {repo_slug}\n"
-        f"Run: {run['run_title']}\n"
         f"By: {run['actor']}\n"
         f"URL: {run['url']}"
     )
@@ -402,8 +402,8 @@ def workflow_finished_text(repo_slug: str, run: dict) -> str:
     conclusion = run.get("conclusion") or run.get("status") or "unknown"
     return (
         f"GitHub Actions: {run['name']} finished\n\n"
+        f"Run: {run['run_title']}\n\n"
         f"Repo: {repo_slug}\n"
-        f"Run: {run['run_title']}\n"
         f"By: {run['actor']}\n"
         f"Result: {conclusion}\n"
         f"URL: {run['url']}"
