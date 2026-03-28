@@ -391,12 +391,10 @@ def is_active_workflow_run(run: dict) -> bool:
 def workflow_started_text(run: dict) -> str:
     run_name = html.escape(run["run_title"])
     workflow_name = html.escape(run["name"])
-    actor_name = html.escape(run["actor"])
     run_url = html.escape(run["url"], quote=True)
     return (
         f"GitHub Actions: {workflow_name} started\n"
-        f"Run: <a href=\"{run_url}\">{run_name}</a>\n\n"
-        f"By: {actor_name}"
+        f"Run: <a href=\"{run_url}\">{run_name}</a>"
     )
 
 
@@ -404,13 +402,11 @@ def workflow_finished_text(run: dict) -> str:
     conclusion = run.get("conclusion") or run.get("status") or "unknown"
     run_name = html.escape(run["run_title"])
     workflow_name = html.escape(run["name"])
-    actor_name = html.escape(run["actor"])
     conclusion_text = html.escape(conclusion)
     run_url = html.escape(run["url"], quote=True)
     return (
         f"GitHub Actions: {workflow_name} finished\n"
         f"Run: <a href=\"{run_url}\">{run_name}</a>\n\n"
-        f"By: {actor_name}\n"
         f"Result: {conclusion_text}"
     )
 
