@@ -820,6 +820,10 @@ def access_denied_text(user_id: int) -> str:
     )
 
 
+def busy_lock_text() -> str:
+    return "Почекайте, у мене не 10 рук. Закінчу попередню задачу, і потім скажете що далі робити"
+
+
 def help_text() -> str:
     command_lines = "\n".join(
         f"/{item['command']} - {item['description']}" for item in BOT_COMMANDS
@@ -1355,7 +1359,7 @@ def handle_message(message: dict, state: dict) -> None:
         return
     if command == "/new":
         if get_active_request(user_id):
-            send_message(chat_id, "A request is still running. Wait for it to finish, or use /debug to watch the technical trace.")
+            send_message(chat_id, busy_lock_text())
             return
         session_state["has_session"] = False
         save_state(state)
@@ -1382,7 +1386,7 @@ def handle_message(message: dict, state: dict) -> None:
         return
 
     if get_active_request(user_id):
-        send_message(chat_id, "A request is already running. Wait for it to finish, or use /debug to watch the full technical trace.")
+        send_message(chat_id, busy_lock_text())
         return
 
     attachment_path = None
