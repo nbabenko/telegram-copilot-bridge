@@ -388,25 +388,30 @@ def is_active_workflow_run(run: dict) -> bool:
     return str(run.get("status", "")).strip().lower() != "completed"
 
 
-def workflow_started_text(repo_slug: str, run: dict) -> str:
+def workflow_started_text(run: dict) -> str:
+    run_name = html.escape(run["run_title"])
+    workflow_name = html.escape(run["name"])
+    actor_name = html.escape(run["actor"])
+    run_url = html.escape(run["url"], quote=True)
     return (
-        f"GitHub Actions: {run['name']} started\n\n"
-        f"Run: {run['run_title']}\n\n"
-        f"Repo: {repo_slug}\n"
-        f"By: {run['actor']}\n"
-        f"URL: {run['url']}"
+        f"GitHub Actions: {workflow_name} started\n"
+        f"Run: <a href=\"{run_url}\">{run_name}</a>\n\n"
+        f"By: {actor_name}"
     )
 
 
-def workflow_finished_text(repo_slug: str, run: dict) -> str:
+def workflow_finished_text(run: dict) -> str:
     conclusion = run.get("conclusion") or run.get("status") or "unknown"
+    run_name = html.escape(run["run_title"])
+    workflow_name = html.escape(run["name"])
+    actor_name = html.escape(run["actor"])
+    conclusion_text = html.escape(conclusion)
+    run_url = html.escape(run["url"], quote=True)
     return (
-        f"GitHub Actions: {run['name']} finished\n\n"
-        f"Run: {run['run_title']}\n\n"
-        f"Repo: {repo_slug}\n"
-        f"By: {run['actor']}\n"
-        f"Result: {conclusion}\n"
-        f"URL: {run['url']}"
+        f"GitHub Actions: {workflow_name} finished\n"
+        f"Run: <a href=\"{run_url}\">{run_name}</a>\n\n"
+        f"By: {actor_name}\n"
+        f"Result: {conclusion_text}"
     )
 
 
@@ -1491,7 +1496,7 @@ def poll_github_action_updates(state: dict) -> None:
                             if initialized and is_active_workflow_run(run):
                                 for chat_id, workflow_ids in subscriptions_by_chat.items():
                                     if workflow_id in workflow_ids:
-                                        notifications.append((chat_id, workflow_started_text(repo_slug, run)))
+                                        notifications.append((chat_id, workflow_started_text(run)))
                             continue
 
                         previous_status = str(previous.get("status", "unknown"))
@@ -1502,7 +1507,7 @@ def poll_github_action_updates(state: dict) -> None:
                             if previous_status != "completed" and current_status == "completed":
                                 for chat_id, workflow_ids in subscriptions_by_chat.items():
                                     if workflow_id in workflow_ids:
-                                        notifications.append((chat_id, workflow_finished_text(repo_slug, run)))
+                                        notifications.append((chat_id, workflow_finished_text(run)))
 
                 known_ids = {str(run_id) for run_id in known_runs.keys()}
                 active_known: dict[str, dict] = {}
@@ -1537,7 +1542,7 @@ def poll_github_action_updates(state: dict) -> None:
 
             for chat_id, text in notifications:
                 try:
-                    send_text_blocks(chat_id, text)
+                    send_message(chat_id, text, parse_mode="HTML")
                 except Exception as error:
                     print(
                         f"bridge warning: failed to send GitHub Actions notification to chat {chat_id}: {error}",
