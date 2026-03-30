@@ -120,6 +120,7 @@ The bridge can process Telegram attachments such as documents and photos.
 - the downloaded path is appended to the Copilot prompt
 - by default, uploads are stored in `.telegram-copilot-uploads/` inside the configured repository
 - the bridge also passes `--add-dir` for that upload directory to Copilot CLI
+- Telegram Bot API downloads are limited to 20 MB; larger Telegram media now fail with an explicit size-related error instead of a generic HTTP 400
 
 This keeps file paths accessible without requiring manual approval for unrelated locations.
 

@@ -57,6 +57,7 @@ GITHUB_ACTIONS_REPO = os.environ.get("GITHUB_ACTIONS_REPO", "").strip()
 GITHUB_POLL_INTERVAL = max(15, int(os.environ.get("GITHUB_POLL_INTERVAL", "45")))
 ACTION_SELECTION_TTL = 900
 ACTION_RUNS_PER_WORKFLOW = 10
+TELEGRAM_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024
 BOT_COMMANDS = [
     {"command": "start", "description": "Show help and quick start"},
     {"command": "help", "description": "Show help and commands"},
@@ -727,64 +728,158 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "telegram_file"
 
 
-def download_telegram_file(file_id: str, preferred_name: str | None = None) -> Path:
-    file_info = telegram_request("getFile", {"file_id": file_id})
-    if not file_info.get("ok"):
-        raise RuntimeError("Failed to resolve Telegram file path")
-    file_path = file_info["result"].get("file_path")
-    if not file_path:
-        raise RuntimeError("Telegram did not return a downloadable file path")
-
-    source_name = preferred_name or Path(file_path).name
-    safe_name = sanitize_filename(source_name)
-    target = UPLOAD_DIR / f"{int(time.time())}_{safe_name}"
-    encoded_path = urllib.parse.quote(file_path, safe="/")
-    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{encoded_path}"
-    with urllib.request.urlopen(download_url, timeout=TELEGRAM_TIMEOUT + 30) as response:
-        target.write_bytes(response.read())
-    return target
-
-
-def extract_attachment(message: dict) -> tuple[str, str | None] | None:
+def describe_attachment(message: dict) -> dict | None:
     animation = message.get("animation")
     if animation:
-        return animation.get("file_id"), animation.get("file_name") or "telegram_animation.mp4"
+        return {
+            "file_id": animation.get("file_id"),
+            "preferred_name": animation.get("file_name") or "telegram_animation.mp4",
+            "file_size": int(animation.get("file_size") or 0),
+            "kind": "animation",
+        }
 
     document = message.get("document")
     if document:
-        return document.get("file_id"), document.get("file_name")
+        return {
+            "file_id": document.get("file_id"),
+            "preferred_name": document.get("file_name"),
+            "file_size": int(document.get("file_size") or 0),
+            "kind": "document",
+        }
 
     photo = message.get("photo") or []
     if photo:
-        return photo[-1].get("file_id"), "telegram_photo.jpg"
+        largest = photo[-1]
+        return {
+            "file_id": largest.get("file_id"),
+            "preferred_name": "telegram_photo.jpg",
+            "file_size": int(largest.get("file_size") or 0),
+            "kind": "photo",
+        }
 
     audio = message.get("audio")
     if audio:
-        return audio.get("file_id"), audio.get("file_name") or "telegram_audio"
+        return {
+            "file_id": audio.get("file_id"),
+            "preferred_name": audio.get("file_name") or "telegram_audio",
+            "file_size": int(audio.get("file_size") or 0),
+            "kind": "audio",
+        }
 
     video = message.get("video")
     if video:
-        return video.get("file_id"), video.get("file_name") or "telegram_video.mp4"
+        return {
+            "file_id": video.get("file_id"),
+            "preferred_name": video.get("file_name") or "telegram_video.mp4",
+            "file_size": int(video.get("file_size") or 0),
+            "kind": "video",
+        }
 
     video_note = message.get("video_note")
     if video_note:
-        return video_note.get("file_id"), "telegram_video_note.mp4"
+        return {
+            "file_id": video_note.get("file_id"),
+            "preferred_name": "telegram_video_note.mp4",
+            "file_size": int(video_note.get("file_size") or 0),
+            "kind": "video_note",
+        }
 
     voice = message.get("voice")
     if voice:
-        return voice.get("file_id"), "telegram_voice.ogg"
+        return {
+            "file_id": voice.get("file_id"),
+            "preferred_name": "telegram_voice.ogg",
+            "file_size": int(voice.get("file_size") or 0),
+            "kind": "voice",
+        }
 
     paid_media = message.get("paid_media") or {}
     for item in paid_media.get("paid_media") or []:
         if item.get("type") == "video" and item.get("video"):
             video = item["video"]
-            return video.get("file_id"), video.get("file_name") or "telegram_paid_video.mp4"
+            return {
+                "file_id": video.get("file_id"),
+                "preferred_name": video.get("file_name") or "telegram_paid_video.mp4",
+                "file_size": int(video.get("file_size") or 0),
+                "kind": "paid_video",
+            }
         if item.get("type") == "photo" and item.get("photo"):
             photo = item.get("photo") or []
             if photo:
-                return photo[-1].get("file_id"), "telegram_paid_photo.jpg"
+                largest = photo[-1]
+                return {
+                    "file_id": largest.get("file_id"),
+                    "preferred_name": "telegram_paid_photo.jpg",
+                    "file_size": int(largest.get("file_size") or 0),
+                    "kind": "paid_photo",
+                }
 
     return None
+
+
+def extract_attachment(message: dict) -> tuple[str, str | None] | None:
+    attachment = describe_attachment(message)
+    if not attachment:
+        return None
+    return attachment.get("file_id"), attachment.get("preferred_name")
+
+
+def oversize_download_error(file_size: int) -> RuntimeError:
+    return RuntimeError(
+        "Telegram Bot API refused to download this file because it is larger than 20 MB. "
+        f"Reported size: {file_size / (1024 * 1024):.1f} MB. "
+        "Please send a smaller file, compress the video, or upload it outside Telegram."
+    )
+
+
+def build_download_urls(file_path: str) -> list[str]:
+    encoded_path = urllib.parse.quote(file_path, safe="/")
+    urls = [
+        f"https://api.telegram.org/file/bot{BOT_TOKEN}/{encoded_path}",
+    ]
+    raw_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    if raw_url not in urls:
+        urls.append(raw_url)
+    return urls
+
+
+def download_telegram_file(file_id: str, preferred_name: str | None = None, file_size: int = 0) -> Path:
+    if file_size and file_size > TELEGRAM_DOWNLOAD_MAX_BYTES:
+        raise oversize_download_error(file_size)
+
+    file_info = telegram_request("getFile", {"file_id": file_id})
+    if not file_info.get("ok"):
+        raise RuntimeError("Failed to resolve Telegram file path")
+    result = file_info["result"] or {}
+    file_path = result.get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram did not return a downloadable file path")
+
+    resolved_size = int(result.get("file_size") or file_size or 0)
+    if resolved_size and resolved_size > TELEGRAM_DOWNLOAD_MAX_BYTES:
+        raise oversize_download_error(resolved_size)
+
+    source_name = preferred_name or Path(file_path).name
+    safe_name = sanitize_filename(source_name)
+    target = UPLOAD_DIR / f"{int(time.time())}_{safe_name}"
+    last_error: Exception | None = None
+    for download_url in build_download_urls(file_path):
+        try:
+            with urllib.request.urlopen(download_url, timeout=TELEGRAM_TIMEOUT + 30) as response:
+                target.write_bytes(response.read())
+            return target
+        except Exception as error:
+            last_error = error
+            continue
+
+    print(
+        f"bridge warning: failed Telegram download for file_id={file_id} file_path={file_path!r} size={resolved_size or 'unknown'}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if last_error is not None:
+        raise RuntimeError(f"Telegram file download failed: {last_error}")
+    raise RuntimeError("Telegram file download failed for an unknown reason")
 
 
 def load_state() -> dict:
@@ -1116,20 +1211,24 @@ def terminate_process(process: subprocess.Popen) -> None:
 
 
 def begin_upload_from_message(state: dict, user_id: int, chat_id: int, source_message: dict) -> None:
-    attachment = extract_attachment(source_message)
-    if not attachment:
+    attachment = describe_attachment(source_message)
+    if not attachment or not attachment.get("file_id"):
         send_message(chat_id, "That message does not include downloadable media.")
         return
 
     clear_upload_session(state, user_id, cleanup_local_file=True)
 
     try:
-        attachment_path = download_telegram_file(*attachment)
+        attachment_path = download_telegram_file(
+            str(attachment.get("file_id")),
+            attachment.get("preferred_name"),
+            int(attachment.get("file_size") or 0),
+        )
     except Exception as error:
         send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}")
         return
 
-    source_name = attachment[1] or attachment_path.name
+    source_name = attachment.get("preferred_name") or attachment_path.name
     set_upload_session(
         state,
         user_id,
@@ -1480,10 +1579,14 @@ def handle_message(message: dict, state: dict) -> None:
         return
 
     attachment_path = None
-    attachment = extract_attachment(message)
-    if attachment:
+    attachment = describe_attachment(message)
+    if attachment and attachment.get("file_id"):
         try:
-            attachment_path = download_telegram_file(*attachment)
+            attachment_path = download_telegram_file(
+                str(attachment.get("file_id")),
+                attachment.get("preferred_name"),
+                int(attachment.get("file_size") or 0),
+            )
         except Exception as error:
             send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}")
             send_group_done_ack(chat_id, message)
@@ -1493,10 +1596,14 @@ def handle_message(message: dict, state: dict) -> None:
     referenced_attachment_path = None
     referenced_attachment_warning = None
     if referenced_message:
-        referenced_attachment = extract_attachment(referenced_message)
-        if referenced_attachment:
+        referenced_attachment = describe_attachment(referenced_message)
+        if referenced_attachment and referenced_attachment.get("file_id"):
             try:
-                referenced_attachment_path = download_telegram_file(*referenced_attachment)
+                referenced_attachment_path = download_telegram_file(
+                    str(referenced_attachment.get("file_id")),
+                    referenced_attachment.get("preferred_name"),
+                    int(referenced_attachment.get("file_size") or 0),
+                )
             except Exception as error:
                 referenced_attachment_warning = str(error)
                 print(

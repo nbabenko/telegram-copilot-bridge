@@ -48,6 +48,28 @@ class BotTests(unittest.TestCase):
         self.assertIn("/debug", text)
         self.assertNotIn("не 10 рук", text)
 
+    def test_describe_attachment_includes_video_size(self):
+        attachment = bot.describe_attachment(
+            {
+                "video": {
+                    "file_id": "abc123",
+                    "file_name": "clip.mp4",
+                    "file_size": 12345,
+                }
+            }
+        )
+
+        self.assertEqual(attachment["file_id"], "abc123")
+        self.assertEqual(attachment["preferred_name"], "clip.mp4")
+        self.assertEqual(attachment["file_size"], 12345)
+        self.assertEqual(attachment["kind"], "video")
+
+    def test_download_telegram_file_rejects_oversize_media_before_api_call(self):
+        with self.assertRaises(RuntimeError) as error:
+            bot.download_telegram_file("file-id", "large.mp4", bot.TELEGRAM_DOWNLOAD_MAX_BYTES + 1)
+
+        self.assertIn("larger than 20 MB", str(error.exception))
+
     def test_cancel_active_request_marks_request_and_terminates_process(self):
         process = DummyProcess()
         bot.ACTIVE_REQUESTS[1] = {
