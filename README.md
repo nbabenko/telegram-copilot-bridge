@@ -75,7 +75,7 @@ python3 bot.py
 - `/unwatch <number|name|all>` - stop workflow notifications in the current chat
 - `/debug` - show the latest full technical trace or attach to the current request trace
 - `/upload` - upload Telegram media to object storage after you provide a name
-- `/cancel` - cancel a pending upload
+- `/cancel` - cancel a pending upload or stop the active Copilot request
 - `/copilot <prompt>` - send an explicit prompt
 - plain text message - send that text to Copilot
 
@@ -108,6 +108,8 @@ Use `/debug` in one of two ways:
 
 - if a request is currently running, `/debug` replays the full technical trace from the start and keeps streaming technical details until that request finishes
 - if no request is running, `/debug` returns the full technical trace for your latest completed reply
+
+If a request is still running and you want to stop it, use `/cancel`. The bridge will terminate the active Copilot subprocess, reset your per-user session state, and let you start a fresh request immediately.
 
 This keeps ordinary chats readable while preserving a way to inspect the raw execution details when needed.
 ## File Uploads

@@ -2,6 +2,7 @@
 import html
 import json
 import os
+import signal
 import re
 import subprocess
 import sys
@@ -67,7 +68,7 @@ BOT_COMMANDS = [
     {"command": "unwatch", "description": "Unsubscribe this chat from a workflow"},
     {"command": "upload", "description": "Upload Telegram media to object storage"},
     {"command": "debug", "description": "Show or enable full technical trace"},
-    {"command": "cancel", "description": "Cancel a pending upload"},
+    {"command": "cancel", "description": "Cancel a pending upload or active request"},
     {"command": "copilot", "description": "Send an explicit prompt to Copilot"},
 ]
 STATE_LOCK = threading.RLock()
@@ -515,9 +516,41 @@ def start_active_request(user_id: int, chat_id: int, message: dict) -> dict:
         "message": message,
         "raw_blocks": [],
         "debug_enabled": False,
+        "process": None,
+        "cancel_requested": False,
+        "started_at": int(time.time()),
     }
     with REQUESTS_LOCK:
         ACTIVE_REQUESTS[user_id] = request
+    return request
+
+
+def bind_active_request_process(user_id: int, process: subprocess.Popen) -> bool:
+    with REQUESTS_LOCK:
+        request = ACTIVE_REQUESTS.get(user_id)
+        if request is None:
+            return False
+        request["process"] = process
+        if request.get("cancel_requested"):
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        return True
+
+
+def cancel_active_request(user_id: int) -> dict | None:
+    with REQUESTS_LOCK:
+        request = ACTIVE_REQUESTS.get(user_id)
+        if request is None:
+            return None
+        request["cancel_requested"] = True
+        process = request.get("process")
+    if process is not None and process.poll() is None:
+        try:
+            process.terminate()
+        except Exception:
+            pass
     return request
 
 
@@ -821,7 +854,11 @@ def access_denied_text(user_id: int) -> str:
 
 
 def busy_lock_text() -> str:
-    return "Почекайте, у мене не 10 рук. Закінчу попередню задачу, і потім скажете що далі робити"
+    return (
+        "I am still working on your previous request.\n\n"
+        "Use /cancel to stop it, /debug to inspect the live technical trace, "
+        "or wait for it to finish before starting a new task."
+    )
 
 
 def help_text() -> str:
@@ -1059,6 +1096,25 @@ def build_copilot_env() -> dict[str, str]:
     return env
 
 
+def terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except Exception:
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except Exception:
+        pass
+    try:
+        process.kill()
+        process.wait(timeout=5)
+    except Exception:
+        pass
+
+
 def begin_upload_from_message(state: dict, user_id: int, chat_id: int, source_message: dict) -> None:
     attachment = extract_attachment(source_message)
     if not attachment:
@@ -1167,6 +1223,14 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
         bufsize=1,
         env=build_copilot_env(),
     )
+    worker = threading.current_thread()
+    user_id = getattr(worker, "user_id", None)
+    if user_id is None:
+        terminate_process(process)
+        return False, False, "Worker metadata is missing for this request."
+    if not bind_active_request_process(user_id, process):
+        terminate_process(process)
+        return False, False, "Request state was lost before Copilot started."
     deadline = time.monotonic() + COPILOT_TIMEOUT
     buffer: list[str] = []
     sent_any = False
@@ -1186,8 +1250,13 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
 
     try:
         while True:
+            active_request = get_active_request(user_id)
+            if active_request is None or active_request.get("cancel_requested"):
+                terminate_process(process)
+                flush_buffer()
+                return False, sent_any, "Request was cancelled."
             if time.monotonic() > deadline:
-                process.kill()
+                terminate_process(process)
                 flush_buffer()
                 return False, sent_any, f"Timed out after {COPILOT_TIMEOUT} seconds."
 
@@ -1211,13 +1280,18 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
 
         process.wait(timeout=5)
     except Exception as error:
-        process.kill()
+        terminate_process(process)
         flush_buffer()
         return False, sent_any, str(error)
 
     flush_buffer()
+    active_request = get_active_request(user_id)
+    if active_request is None or active_request.get("cancel_requested"):
+        return False, sent_any, "Request was cancelled."
     if process.returncode == 0:
         return True, sent_any, ""
+    if process.returncode in {-signal.SIGTERM, -signal.SIGKILL}:
+        return False, sent_any, "Request was cancelled."
     return False, sent_any, f"Exit code {process.returncode}"
 
 
@@ -1275,6 +1349,8 @@ def process_copilot_request(state: dict, message: dict, prompt: str, continue_se
     request = start_active_request(user_id, chat_id, message)
     send_typing(chat_id)
     send_message(chat_id, "Working...")
+    worker = threading.current_thread()
+    worker.user_id = user_id
 
     def on_block(block: str) -> None:
         debug_enabled, debug_chat_id = append_active_request_block(user_id, block)
@@ -1296,6 +1372,15 @@ def process_copilot_request(state: dict, message: dict, prompt: str, continue_se
             send_text_blocks(chat_id, summary_text)
         elif not sent_any:
             send_message(chat_id, "Task finished.")
+        send_group_done_ack(chat_id, message)
+        return
+
+    session_state = get_session_state(state, user_id)
+    session_state["has_session"] = False
+    save_state(state)
+
+    if completed_request.get("cancel_requested") or result == "Request was cancelled.":
+        send_message(chat_id, "Cancelled the active request and reset your Copilot session. You can start a new one now.")
         send_group_done_ack(chat_id, message)
         return
 
@@ -1354,7 +1439,12 @@ def handle_message(message: dict, state: dict) -> None:
         handle_debug_command(message, state)
         return
     if command == "/cancel":
-        send_message(chat_id, "There is no pending upload to cancel.")
+        active_request = get_active_request(user_id)
+        if active_request:
+            cancel_active_request(user_id)
+            send_message(chat_id, "Stopping the active request. I will reset your session as soon as the worker exits.")
+            return
+        send_message(chat_id, "There is no pending upload or active request to cancel.")
         send_group_done_ack(chat_id, message)
         return
     if command == "/new":
