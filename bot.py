@@ -48,6 +48,7 @@ TELEGRAM_MESSAGE_MAX_LEN = 3900
 STREAM_FLUSH_MAX_LEN = 3600
 STREAM_FLUSH_INTERVAL = 4.0
 STREAM_FLUSH_MIN_PARAGRAPH_LEN = 1200
+MEDIA_GROUP_BUFFER_SECONDS = max(0.2, float(os.environ.get("MEDIA_GROUP_BUFFER_SECONDS", "1.2")))
 UPLOAD_TOOL = BASE_DIR / "scripts" / "upload-media.mjs"
 DEBUG_TRACE_MAX_CHARS = 400000
 GITHUB_API_BASE = "https://api.github.com"
@@ -74,7 +75,9 @@ BOT_COMMANDS = [
 ]
 STATE_LOCK = threading.RLock()
 REQUESTS_LOCK = threading.RLock()
+MEDIA_GROUPS_LOCK = threading.RLock()
 ACTIVE_REQUESTS: dict[int, dict] = {}
+PENDING_MEDIA_GROUPS: dict[str, dict] = {}
 
 TECHNICAL_LINE_PATTERNS = [
     re.compile(r"^\s*[●◦○◆].*"),
@@ -723,6 +726,80 @@ def should_handle_message(message: dict, user_id: int, text: str) -> bool:
     return message_mentions_bot(message, text)
 
 
+def get_media_group_messages(message: dict) -> list[dict]:
+    grouped = message.get("_media_group_messages")
+    if isinstance(grouped, list) and grouped:
+        return grouped
+    return [message]
+
+
+def select_media_group_primary_message(messages: list[dict]) -> dict:
+    for item in messages:
+        if get_message_text(item).strip():
+            return item
+    return messages[0]
+
+
+def build_media_group_message(messages: list[dict]) -> dict:
+    ordered = sorted(messages, key=lambda item: int(item.get("message_id", 0) or 0))
+    primary = dict(select_media_group_primary_message(ordered))
+    primary["_media_group_messages"] = ordered
+    return primary
+
+
+def media_group_key(message: dict) -> str | None:
+    media_group_id = str(message.get("media_group_id") or "").strip()
+    if not media_group_id:
+        return None
+    chat_id = (message.get("chat") or {}).get("id")
+    user_id = (message.get("from") or {}).get("id")
+    if chat_id is None or user_id is None:
+        return None
+    return f"{chat_id}:{user_id}:{media_group_id}"
+
+
+def queue_media_group_message(message: dict) -> None:
+    key = media_group_key(message)
+    if not key:
+        return
+    due_at = time.monotonic() + MEDIA_GROUP_BUFFER_SECONDS
+    message_id = int(message.get("message_id", 0) or 0)
+    with MEDIA_GROUPS_LOCK:
+        bucket = PENDING_MEDIA_GROUPS.setdefault(
+            key,
+            {"messages": {}, "due_at": due_at, "first_message_id": message_id},
+        )
+        bucket["messages"][message_id] = message
+        bucket["due_at"] = due_at
+        bucket["first_message_id"] = min(int(bucket.get("first_message_id", message_id)), message_id)
+
+
+def pop_ready_media_group_messages(force: bool = False) -> list[dict]:
+    ready: list[tuple[int, dict]] = []
+    now = time.monotonic()
+    with MEDIA_GROUPS_LOCK:
+        expired_keys = [
+            key
+            for key, bucket in PENDING_MEDIA_GROUPS.items()
+            if force or float(bucket.get("due_at", 0.0) or 0.0) <= now
+        ]
+        for key in expired_keys:
+            bucket = PENDING_MEDIA_GROUPS.pop(key, None)
+            if not bucket:
+                continue
+            messages = list((bucket.get("messages") or {}).values())
+            if not messages:
+                continue
+            ready.append((int(bucket.get("first_message_id", 0) or 0), build_media_group_message(messages)))
+    ready.sort(key=lambda item: item[0])
+    return [message for _, message in ready]
+
+
+def has_pending_media_groups() -> bool:
+    with MEDIA_GROUPS_LOCK:
+        return bool(PENDING_MEDIA_GROUPS)
+
+
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
     return cleaned or "telegram_file"
@@ -817,10 +894,26 @@ def describe_attachment(message: dict) -> dict | None:
     return None
 
 
+def get_message_attachments(message: dict) -> list[dict]:
+    attachments: list[dict] = []
+    seen_file_ids: set[str] = set()
+    for item in get_media_group_messages(message):
+        attachment = describe_attachment(item)
+        if not attachment:
+            continue
+        file_id = str(attachment.get("file_id") or "")
+        if not file_id or file_id in seen_file_ids:
+            continue
+        seen_file_ids.add(file_id)
+        attachments.append(attachment)
+    return attachments
+
+
 def extract_attachment(message: dict) -> tuple[str, str | None] | None:
-    attachment = describe_attachment(message)
-    if not attachment:
+    attachments = get_message_attachments(message)
+    if not attachments:
         return None
+    attachment = attachments[0]
     return attachment.get("file_id"), attachment.get("preferred_name")
 
 
@@ -1210,11 +1303,53 @@ def terminate_process(process: subprocess.Popen) -> None:
         pass
 
 
+def download_message_attachments(message: dict) -> list[Path]:
+    downloaded_paths: list[Path] = []
+    try:
+        for attachment in get_message_attachments(message):
+            downloaded_paths.append(
+                download_telegram_file(
+                    str(attachment.get("file_id")),
+                    attachment.get("preferred_name"),
+                    int(attachment.get("file_size") or 0),
+                )
+            )
+    except Exception:
+        for path in downloaded_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise
+    return downloaded_paths
+
+
+def build_attachment_prompt_context(attachment_paths: list[Path]) -> str:
+    if not attachment_paths:
+        return ""
+    if len(attachment_paths) == 1:
+        return (
+            f"Use the uploaded Telegram file at: {attachment_paths[0]}\n"
+            "This file is stored inside the repository-accessible upload directory.\n"
+            "Read and process that file directly from disk."
+        )
+
+    lines = ["Use the uploaded Telegram files at:"]
+    lines.extend(f"- {path}" for path in attachment_paths)
+    lines.append("These files are stored inside the repository-accessible upload directory.")
+    lines.append("Read and process those files directly from disk.")
+    return "\n".join(lines)
+
+
 def begin_upload_from_message(state: dict, user_id: int, chat_id: int, source_message: dict) -> None:
-    attachment = describe_attachment(source_message)
-    if not attachment or not attachment.get("file_id"):
+    attachments = get_message_attachments(source_message)
+    if not attachments:
         send_message(chat_id, "That message does not include downloadable media.")
         return
+    if len(attachments) != 1:
+        send_message(chat_id, "Upload works with one media file at a time. Send a single file with /upload, or reply /upload to one specific item.")
+        return
+    attachment = attachments[0]
 
     clear_upload_session(state, user_id, cleanup_local_file=True)
 
@@ -1267,7 +1402,7 @@ def handle_pending_upload(message: dict, state: dict, upload_session: dict) -> b
 
     stage = upload_session.get("stage")
     if stage == "awaiting_media":
-        if extract_attachment(message):
+        if get_message_attachments(message):
             begin_upload_from_message(state, user_id, chat_id, message)
             send_group_done_ack(chat_id, message)
             return True
@@ -1560,9 +1695,9 @@ def handle_message(message: dict, state: dict) -> None:
         send_group_done_ack(chat_id, message)
         return
     if command == "/upload":
-        current_attachment = extract_attachment(message)
+        current_attachment = get_message_attachments(message)
         reply_message = message.get("reply_to_message")
-        reply_attachment = extract_attachment(reply_message) if reply_message else None
+        reply_attachment = get_message_attachments(reply_message) if reply_message else []
 
         if current_attachment:
             begin_upload_from_message(state, user_id, chat_id, message)
@@ -1578,15 +1713,10 @@ def handle_message(message: dict, state: dict) -> None:
         send_message(chat_id, busy_lock_text())
         return
 
-    attachment_path = None
-    attachment = describe_attachment(message)
-    if attachment and attachment.get("file_id"):
+    attachment_paths: list[Path] = []
+    if get_message_attachments(message):
         try:
-            attachment_path = download_telegram_file(
-                str(attachment.get("file_id")),
-                attachment.get("preferred_name"),
-                int(attachment.get("file_size") or 0),
-            )
+            attachment_paths = download_message_attachments(message)
         except Exception as error:
             send_message(chat_id, f"Failed to download Telegram attachment:\n\n{error}")
             send_group_done_ack(chat_id, message)
@@ -1625,13 +1755,9 @@ def handle_message(message: dict, state: dict) -> None:
         send_group_done_ack(chat_id, message)
         return
 
-    if attachment_path is not None:
-        prompt = (
-            f"{prompt}\n\n"
-            f"Use the uploaded Telegram file at: {attachment_path}\n"
-            f"This file is stored inside the repository-accessible upload directory.\n"
-            f"Read and process that file directly from disk."
-        )
+    attachment_context = build_attachment_prompt_context(attachment_paths)
+    if attachment_context:
+        prompt = f"{prompt}\n\n{attachment_context}"
 
     if referenced_message:
         referenced_context = build_referenced_message_context(referenced_message, referenced_attachment_path)
@@ -1762,14 +1888,24 @@ def main() -> int:
         try:
             updates = telegram_request(
                 "getUpdates",
-                {"offset": str(state.get("offset", 0)), "timeout": str(TELEGRAM_TIMEOUT)},
+                {
+                    "offset": str(state.get("offset", 0)),
+                    "timeout": str(1 if has_pending_media_groups() else TELEGRAM_TIMEOUT),
+                },
             )
             for update in updates.get("result", []):
                 state["offset"] = update["update_id"] + 1
                 save_state(state)
                 message = update.get("message")
                 if message and ("text" in message or "caption" in message or extract_attachment(message)):
+                    if message.get("media_group_id"):
+                        queue_media_group_message(message)
+                        continue
                     handle_message(message, state)
+                for grouped_message in pop_ready_media_group_messages():
+                    handle_message(grouped_message, state)
+            for grouped_message in pop_ready_media_group_messages():
+                handle_message(grouped_message, state)
         except KeyboardInterrupt:
             return 0
         except Exception as error:

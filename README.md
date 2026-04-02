@@ -118,6 +118,7 @@ The bridge can process Telegram attachments such as documents and photos.
 
 - uploads are downloaded locally before Copilot is called
 - the downloaded path is appended to the Copilot prompt
+- if a Telegram album contains multiple images or files in one message group, the bridge waits briefly, collects the whole group, and appends every downloaded local path to one Copilot request
 - by default, uploads are stored in `.telegram-copilot-uploads/` inside the configured repository
 - the bridge also passes `--add-dir` for that upload directory to Copilot CLI
 - Telegram Bot API downloads are limited to 20 MB; larger Telegram media now fail with an explicit size-related error instead of a generic HTTP 400
@@ -130,6 +131,7 @@ This keeps file paths accessible without requiring manual approval for unrelated
 
 - send `/upload` with attached media, or reply `/upload` to a Telegram message that already has media
 - if you send `/upload` without media first, the bridge waits for your next media message
+- `/upload` currently accepts one media file at a time; albums should be handled through the Copilot flow instead of the storage-upload flow
 - after the file is downloaded locally, the bridge asks for a storage name
 - the upload helper refuses to overwrite an existing object key
 - `.mov` files are converted to `.mp4` with `ffmpeg` before upload

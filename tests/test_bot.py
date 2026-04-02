@@ -35,12 +35,23 @@ class DummyProcess:
         self.terminated = True
 
 
+class ImmediateThread:
+    def __init__(self, target, args=(), daemon=None):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        self.target(*self.args)
+
+
 class BotTests(unittest.TestCase):
     def setUp(self):
         bot.ACTIVE_REQUESTS.clear()
+        bot.PENDING_MEDIA_GROUPS.clear()
 
     def tearDown(self):
         bot.ACTIVE_REQUESTS.clear()
+        bot.PENDING_MEDIA_GROUPS.clear()
 
     def test_busy_lock_text_points_to_cancel_and_debug(self):
         text = bot.busy_lock_text()
@@ -69,6 +80,102 @@ class BotTests(unittest.TestCase):
             bot.download_telegram_file("file-id", "large.mp4", bot.TELEGRAM_DOWNLOAD_MAX_BYTES + 1)
 
         self.assertIn("larger than 20 MB", str(error.exception))
+
+    def test_queue_media_group_message_combines_album(self):
+        message_one = {
+            "media_group_id": "album-1",
+            "chat": {"id": 100, "type": "private"},
+            "from": {"id": 1},
+            "message_id": 11,
+            "caption": "Compare these screenshots",
+            "photo": [{"file_id": "photo-1", "file_size": 100}],
+        }
+        message_two = {
+            "media_group_id": "album-1",
+            "chat": {"id": 100, "type": "private"},
+            "from": {"id": 1},
+            "message_id": 12,
+            "photo": [{"file_id": "photo-2", "file_size": 120}],
+        }
+
+        with patch.object(bot.time, "monotonic", return_value=100.0):
+            bot.queue_media_group_message(message_one)
+            bot.queue_media_group_message(message_two)
+        with patch.object(bot.time, "monotonic", return_value=102.0):
+            ready = bot.pop_ready_media_group_messages()
+
+        self.assertEqual(len(ready), 1)
+        combined = ready[0]
+        self.assertEqual(bot.get_message_text(combined), "Compare these screenshots")
+        attachments = bot.get_message_attachments(combined)
+        self.assertEqual([item["file_id"] for item in attachments], ["photo-1", "photo-2"])
+
+    def test_handle_message_passes_all_media_group_paths_to_copilot(self):
+        state = {"sessions": {"1": {"has_session": False}}}
+        message = {
+            "chat": {"id": 100, "type": "private"},
+            "from": {"id": 1},
+            "message_id": 60,
+            "caption": "Do you see all screenshots?",
+            "_media_group_messages": [
+                {
+                    "chat": {"id": 100, "type": "private"},
+                    "from": {"id": 1},
+                    "message_id": 60,
+                    "caption": "Do you see all screenshots?",
+                    "photo": [{"file_id": "photo-1", "file_size": 100}],
+                },
+                {
+                    "chat": {"id": 100, "type": "private"},
+                    "from": {"id": 1},
+                    "message_id": 61,
+                    "photo": [{"file_id": "photo-2", "file_size": 120}],
+                },
+            ],
+        }
+        captured = {}
+
+        def fake_process(_state, _message, prompt, _continue_session, _user_id, _chat_id):
+            captured["prompt"] = prompt
+
+        with patch.object(bot, "download_message_attachments", return_value=[Path("/tmp/one.jpg"), Path("/tmp/two.jpg")]):
+            with patch.object(bot, "process_copilot_request", side_effect=fake_process):
+                with patch.object(bot.threading, "Thread", ImmediateThread):
+                    with patch.object(bot, "send_message"):
+                        with patch.object(bot, "send_group_done_ack"):
+                            bot.handle_message(message, state)
+
+        self.assertIn("Use the uploaded Telegram files at:", captured["prompt"])
+        self.assertIn("/tmp/one.jpg", captured["prompt"])
+        self.assertIn("/tmp/two.jpg", captured["prompt"])
+
+    def test_begin_upload_from_message_rejects_multiple_files(self):
+        state = {"sessions": {"1": {"has_session": False}}}
+        message = {
+            "chat": {"id": 100, "type": "private"},
+            "from": {"id": 1},
+            "message_id": 70,
+            "_media_group_messages": [
+                {
+                    "chat": {"id": 100, "type": "private"},
+                    "from": {"id": 1},
+                    "message_id": 70,
+                    "photo": [{"file_id": "photo-1", "file_size": 100}],
+                },
+                {
+                    "chat": {"id": 100, "type": "private"},
+                    "from": {"id": 1},
+                    "message_id": 71,
+                    "photo": [{"file_id": "photo-2", "file_size": 120}],
+                },
+            ],
+        }
+        sent = []
+
+        with patch.object(bot, "send_message", side_effect=lambda *args, **kwargs: sent.append(args[1])):
+            bot.begin_upload_from_message(state, 1, 100, message)
+
+        self.assertIn("one media file at a time", sent[-1])
 
     def test_cancel_active_request_marks_request_and_terminates_process(self):
         process = DummyProcess()
