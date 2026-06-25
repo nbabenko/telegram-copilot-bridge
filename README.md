@@ -1,13 +1,13 @@
-# Telegram Copilot Bridge
+# Telegram AI CLI Bridge
 
-Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for a specific local repository and sends a cleaned human-readable summary back to Telegram by default.
+Minimal Telegram bot that forwards plain text messages to a local AI CLI (GitHub Copilot CLI or Claude CLI) for a specific repository and sends a cleaned human-readable summary back to Telegram by default.
 
 ## What It Does
 
 - Polls a Telegram bot with `getUpdates`
 - Whitelists specific Telegram user IDs
-- Runs `copilot -p` inside a configured repository
-- Continues Copilot context per Telegram user
+- Runs the configured AI CLI inside a configured repository
+- Continues AI session context per Telegram user
 - Returns a human-readable summary by default and exposes the full technical trace through `/debug`
 - Includes replied-to Telegram message text and attachments as Copilot context
 - Accepts `/upload`, asks for a storage name, and uploads Telegram media without overwriting existing names
@@ -18,7 +18,7 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
 - Linux VM or server
 - Python 3
 - Node.js and npm
-- GitHub Copilot CLI installed and authenticated
+- GitHub Copilot CLI or Claude CLI installed and authenticated
 - A Telegram bot token from BotFather
 - At least one Telegram numeric user ID to whitelist
 - Object storage credentials for uploads
@@ -40,8 +40,12 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
    - set `TELEGRAM_BOT_TOKEN`
   - set `BOT_USERNAME` or let the bridge resolve it via `getMe`
    - set `ALLOWED_USER_IDS`
-   - set `REPO_PATH`
+  - set `REPO_PATH`
+  - set `AI_PROVIDER` to `copilot` or `claude`
+  - set `COPILOT_BIN` and/or `CLAUDE_BIN`
   - set `UPLOAD_DIR` to a folder inside the target repository if you want uploaded files to be readable by Copilot without extra path permissions
+  - optional for Claude: set `CLAUDE_COMMANDS_DISCOVERY_CMD` and `CLAUDE_COMMANDS_DIRS` to expose Claude slash commands as Telegram bot commands
+  - optional: set `DEFAULT_VERBOSE=true` to stream technical trace by default instead of user-facing summary
   - set the `OBJECT_STORAGE_*` variables if `/upload` should work
   - optionally set `GITHUB_ACTIONS_REPO=owner/repo`; if omitted, the bridge derives it from the `origin` remote of `REPO_PATH`
   - optionally set `GITHUB_ACTIONS_TOKEN` for private repositories or higher rate limits
@@ -51,10 +55,12 @@ Minimal Telegram bot that forwards plain text messages to GitHub Copilot CLI for
 ```bash
 npm install
 ```
-5. Authenticate Copilot CLI on the machine:
+5. Authenticate your selected CLI on the machine:
 
 ```bash
 copilot login
+# or
+claude auth login
 ```
 
 6. Start locally for a quick test:
@@ -67,17 +73,22 @@ python3 bot.py
 
 - `/start` - show help
 - `/help` - show help
-- `/new` - start a fresh Copilot thread for the current Telegram account
+- `/new` - start a fresh assistant thread for the current Telegram account
 - `/status` - show repo and session status
 - `/actions` - list GitHub Actions workflows for the configured repository
 - `/subscriptions` - show the current chat's workflow subscriptions
 - `/watch <number|name>` - subscribe the current chat to a workflow
 - `/unwatch <number|name|all>` - stop workflow notifications in the current chat
 - `/debug` - show the latest full technical trace or attach to the current request trace
+- `/verbose [on|off|toggle|default]` - control whether your new requests start in verbose technical mode
 - `/upload` - upload Telegram media to object storage after you provide a name
-- `/cancel` - cancel a pending upload or stop the active Copilot request
-- `/copilot <prompt>` - send an explicit prompt
-- plain text message - send that text to Copilot
+- `/cancel` - cancel a pending upload or stop the active AI request
+- `/copilot <prompt>` - explicit Copilot prompt (always accepted)
+- `/claude <prompt>` - explicit Claude prompt (always accepted)
+- `/<provider> <prompt>` - explicit prompt using configured provider (`/copilot` or `/claude`)
+- plain text message - send that text to the configured provider
+
+When `AI_PROVIDER=claude`, the bridge also discovers Claude slash commands and mirrors them to Telegram bot commands. Those Telegram commands are mapped back to Claude slash prompts internally (for example, a Telegram command can execute Claude `/review`).
 
 ## GitHub Actions Notifications
 
@@ -98,11 +109,15 @@ The bridge polls GitHub and sends a message when a watched workflow run first ap
 
 For a fine-grained personal access token, grant repository access to the watched repository and set `Actions: Read-only`.
 
-Use `GITHUB_ACTIONS_TOKEN` for the workflow watcher. Do not reuse that token as the Copilot CLI auth token: the bridge strips the Actions token from the Copilot subprocess to avoid authentication conflicts.
+Use `GITHUB_ACTIONS_TOKEN` for the workflow watcher. Do not reuse that token as the AI CLI auth token: the bridge strips the Actions token from the AI subprocess to avoid authentication conflicts.
 
 ## Output Modes
 
-By default, Telegram receives a cleaned user-facing summary instead of the raw tool-by-tool Copilot trace.
+By default, Telegram receives a cleaned user-facing summary instead of raw tool-by-tool trace output.
+
+Set `DEFAULT_VERBOSE=true` to make technical trace streaming the default mode for every new request.
+
+You can override this per Telegram user with `/verbose on` or `/verbose off`, switch quickly with `/verbose toggle`, or remove your override with `/verbose default`.
 
 Use `/debug` in one of two ways:
 
@@ -116,11 +131,11 @@ This keeps ordinary chats readable while preserving a way to inspect the raw exe
 
 The bridge can process Telegram attachments such as documents and photos.
 
-- uploads are downloaded locally before Copilot is called
-- the downloaded path is appended to the Copilot prompt
+- uploads are downloaded locally before the AI CLI is called
+- the downloaded path is appended to the AI prompt
 - if a Telegram album contains multiple images or files in one message group, the bridge waits briefly, collects the whole group, and appends every downloaded local path to one Copilot request
 - by default, uploads are stored in `.telegram-copilot-uploads/` inside the configured repository
-- the bridge also passes `--add-dir` for that upload directory to Copilot CLI
+- the bridge also passes `--add-dir` for that upload directory to the selected CLI
 - Telegram Bot API downloads are limited to 20 MB; larger Telegram media now fail with an explicit size-related error instead of a generic HTTP 400
 
 This keeps file paths accessible without requiring manual approval for unrelated locations.

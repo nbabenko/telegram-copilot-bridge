@@ -2,6 +2,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -52,6 +53,52 @@ class BotTests(unittest.TestCase):
     def tearDown(self):
         bot.ACTIVE_REQUESTS.clear()
         bot.PENDING_MEDIA_GROUPS.clear()
+
+    def test_save_state_writes_backup_and_normalizes_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            backup_path = Path(temp_dir) / "state.json.bak"
+            state = {"sessions": {"1": {"has_session": True}}}
+
+            with patch.object(bot, "STATE_PATH", state_path), patch.object(bot, "STATE_BACKUP_PATH", backup_path):
+                bot.save_state(state)
+
+            self.assertTrue(state_path.exists())
+            self.assertTrue(backup_path.exists())
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["sessions"]["1"]["has_session"], True)
+            self.assertEqual(saved["offset"], 0)
+            self.assertIn("github_actions", saved)
+            self.assertIn("subscriptions", saved["github_actions"])
+
+    def test_load_state_recovers_from_backup_when_primary_is_invalid(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            backup_path = Path(temp_dir) / "state.json.bak"
+            state_path.write_text("{broken json", encoding="utf-8")
+            backup_path.write_text(
+                json.dumps(
+                    {
+                        "offset": 42,
+                        "sessions": {},
+                        "github_actions": {
+                            "subscriptions": {"-100": [123]},
+                            "selection_cache": {},
+                            "known_runs": {},
+                            "initialized": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(bot, "STATE_PATH", state_path), patch.object(bot, "STATE_BACKUP_PATH", backup_path):
+                loaded = bot.load_state()
+
+            self.assertEqual(loaded["offset"], 42)
+            self.assertEqual(loaded["github_actions"]["subscriptions"], {"-100": [123]})
+            repaired = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["github_actions"]["subscriptions"], {"-100": [123]})
 
     def test_busy_lock_text_points_to_cancel_and_debug(self):
         text = bot.busy_lock_text()
@@ -263,6 +310,36 @@ class BotTests(unittest.TestCase):
         self.assertFalse(state["sessions"]["1"]["has_session"])
         self.assertEqual(sent[0], "Working...")
         self.assertIn("Cancelled the active request", sent[-1])
+
+    def test_verbose_command_sets_user_override(self):
+        state = {"sessions": {"1": {"has_session": False}}, "user_settings": {}}
+        message = {
+            "chat": {"id": 100, "type": "private"},
+            "from": {"id": 1},
+            "message_id": 80,
+            "text": "/verbose on",
+        }
+        sent = []
+
+        with patch.object(bot, "send_message", side_effect=lambda *args, **kwargs: sent.append(args[1])):
+            with patch.object(bot, "send_group_done_ack"):
+                bot.handle_message(message, state)
+
+        self.assertEqual(bot.get_user_verbose_override(state, 1), True)
+        self.assertIn("Verbose mode is now ON", sent[-1])
+
+    def test_start_active_request_uses_per_user_verbose_setting(self):
+        state = {"sessions": {"1": {"has_session": False}}, "user_settings": {"1": {"verbose": True}}}
+        message = {
+            "chat": {"id": 100, "type": "private"},
+            "from": {"id": 1},
+            "message_id": 81,
+            "text": "test",
+        }
+
+        request = bot.start_active_request(1, 100, message, bot.get_user_verbose_mode(state, 1))
+
+        self.assertTrue(request["debug_enabled"])
 
 
 if __name__ == "__main__":

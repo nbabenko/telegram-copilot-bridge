@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -15,6 +16,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "state.json"
+STATE_BACKUP_PATH = BASE_DIR / "state.json.bak"
 
 
 def load_env(env_path: Path) -> None:
@@ -40,10 +42,13 @@ ALLOWED_USER_IDS = {
 REPO_PATH = os.environ.get("REPO_PATH", str(BASE_DIR))
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(Path(REPO_PATH) / ".telegram-copilot-uploads")))
 COPILOT_BIN = os.environ.get("COPILOT_BIN", "/usr/bin/copilot")
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "copilot").strip().lower()
 COPILOT_TIMEOUT = int(os.environ.get("COPILOT_TIMEOUT", "1200"))
 TELEGRAM_TIMEOUT = int(os.environ.get("TELEGRAM_TIMEOUT", "30"))
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@").lower()
+DEFAULT_VERBOSE = os.environ.get("DEFAULT_VERBOSE", "false").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_MESSAGE_MAX_LEN = 3900
 STREAM_FLUSH_MAX_LEN = 3600
 STREAM_FLUSH_INTERVAL = 4.0
@@ -59,10 +64,15 @@ GITHUB_POLL_INTERVAL = max(15, int(os.environ.get("GITHUB_POLL_INTERVAL", "45"))
 ACTION_SELECTION_TTL = 900
 ACTION_RUNS_PER_WORKFLOW = 10
 TELEGRAM_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024
-BOT_COMMANDS = [
+if AI_PROVIDER not in {"copilot", "claude"}:
+    print(f"bridge warning: unsupported AI_PROVIDER={AI_PROVIDER!r}; falling back to 'copilot'", file=sys.stderr, flush=True)
+    AI_PROVIDER = "copilot"
+
+
+STATIC_BOT_COMMANDS = [
     {"command": "start", "description": "Show help and quick start"},
     {"command": "help", "description": "Show help and commands"},
-    {"command": "new", "description": "Start a fresh Copilot thread"},
+    {"command": "new", "description": "Start a fresh assistant thread"},
     {"command": "status", "description": "Show bridge and session status"},
     {"command": "actions", "description": "List GitHub Actions workflows"},
     {"command": "subscriptions", "description": "Show this chat's workflow subscriptions"},
@@ -70,14 +80,235 @@ BOT_COMMANDS = [
     {"command": "unwatch", "description": "Unsubscribe this chat from a workflow"},
     {"command": "upload", "description": "Upload Telegram media to object storage"},
     {"command": "debug", "description": "Show or enable full technical trace"},
+    {"command": "verbose", "description": "Toggle default verbose mode for your requests"},
     {"command": "cancel", "description": "Cancel a pending upload or active request"},
-    {"command": "copilot", "description": "Send an explicit prompt to Copilot"},
 ]
+EXPLICIT_PROMPT_COMMANDS = {
+    "copilot": "Send an explicit prompt to Copilot",
+    "claude": "Send an explicit prompt to Claude",
+}
+CLAUDE_COMMANDS_DISCOVERY_CMD = os.environ.get(
+    "CLAUDE_COMMANDS_DISCOVERY_CMD",
+    f"{CLAUDE_BIN} -p \"/help\" --output-format text",
+).strip()
+CLAUDE_COMMANDS_DIRS = [
+    Path(item).expanduser()
+    for item in os.environ.get(
+        "CLAUDE_COMMANDS_DIRS",
+        f"{Path(REPO_PATH) / '.claude' / 'commands'}:{Path.home() / '.claude' / 'commands'}",
+    ).split(":")
+    if item.strip()
+]
+
+
+def provider_name() -> str:
+    return "Claude" if AI_PROVIDER == "claude" else "Copilot"
+
+
+def provider_bin() -> str:
+    return CLAUDE_BIN if AI_PROVIDER == "claude" else COPILOT_BIN
+
+
+def command_tokens_from_text(raw_text: str) -> list[str]:
+    tokens = re.findall(r"(?<!\w)/([A-Za-z][A-Za-z0-9:_-]{0,64})", raw_text or "")
+    return [token.strip().lstrip("/") for token in tokens if token.strip()]
+
+
+def discover_claude_commands_from_cli() -> list[str]:
+    if not CLAUDE_COMMANDS_DISCOVERY_CMD:
+        return []
+    try:
+        env = os.environ.copy()
+        env.pop("GITHUB_ACTIONS_TOKEN", None)
+        if GITHUB_API_TOKEN and env.get("GITHUB_TOKEN", "").strip() == GITHUB_API_TOKEN:
+            env.pop("GITHUB_TOKEN", None)
+        result = subprocess.run(
+            shlex.split(CLAUDE_COMMANDS_DISCOVERY_CMD),
+            cwd=REPO_PATH,
+            capture_output=True,
+            text=True,
+            timeout=min(COPILOT_TIMEOUT, 30),
+            check=False,
+            env=env,
+        )
+    except Exception as error:
+        print(f"bridge warning: failed to run Claude command discovery: {error}", file=sys.stderr, flush=True)
+        return []
+
+    if result.returncode != 0:
+        output = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+        print(f"bridge warning: Claude command discovery failed: {output}", file=sys.stderr, flush=True)
+        return []
+
+    return command_tokens_from_text(result.stdout)
+
+
+def discover_claude_commands_from_help() -> list[str]:
+    try:
+        result = subprocess.run(
+            [CLAUDE_BIN, "--help"],
+            cwd=REPO_PATH,
+            capture_output=True,
+            text=True,
+            timeout=min(COPILOT_TIMEOUT, 20),
+            check=False,
+        )
+    except Exception:
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    commands: list[str] = []
+    in_commands_section = False
+    for raw_line in (result.stdout or "").splitlines():
+        line = raw_line.rstrip()
+        if line.strip() == "Commands:":
+            in_commands_section = True
+            continue
+        if not in_commands_section:
+            continue
+        if not line.startswith("  "):
+            break
+        token = line.strip().split(maxsplit=1)[0]
+        token = token.split("|")[0].strip()
+        if re.fullmatch(r"[a-z][a-z0-9-]*", token):
+            commands.append(token)
+    return commands
+
+
+def discover_claude_commands_from_dirs() -> list[str]:
+    discovered: set[str] = set()
+    for root in CLAUDE_COMMANDS_DIRS:
+        if not root.exists() or not root.is_dir():
+            continue
+        for file_path in root.rglob("*.md"):
+            try:
+                relative = file_path.relative_to(root)
+            except Exception:
+                continue
+            pieces = [piece.strip() for piece in relative.with_suffix("").parts if piece.strip()]
+            if not pieces:
+                continue
+            command_name = ":".join(pieces)
+            discovered.add(command_name)
+    return sorted(discovered)
+
+
+def map_claude_command_to_telegram_name(command_name: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_]", "_", command_name.lower()).strip("_")
+    if not normalized:
+        normalized = "claude"
+    if not normalized[0].isalpha():
+        normalized = f"c_{normalized}"
+    return normalized[:32]
+
+
+def discover_dynamic_provider_commands() -> list[str]:
+    if AI_PROVIDER != "claude":
+        return []
+    names = set(discover_claude_commands_from_dirs())
+    names.update(discover_claude_commands_from_cli())
+    if not names:
+        names.update(discover_claude_commands_from_help())
+    return sorted(item for item in names if item)
+
+
+def build_bot_commands() -> tuple[list[dict], dict[str, str]]:
+    commands = list(STATIC_BOT_COMMANDS)
+    provider_prompt_command = AI_PROVIDER
+    commands.append(
+        {
+            "command": provider_prompt_command,
+            "description": EXPLICIT_PROMPT_COMMANDS[provider_prompt_command],
+        }
+    )
+
+    slash_aliases: dict[str, str] = {}
+    used_names = {item["command"] for item in commands}
+    for command_name in discover_dynamic_provider_commands():
+        base_name = map_claude_command_to_telegram_name(command_name)
+        alias = base_name
+        suffix = 2
+        while alias in used_names:
+            tail = f"_{suffix}"
+            alias = f"{base_name[: max(1, 32 - len(tail))]}{tail}"
+            suffix += 1
+        used_names.add(alias)
+        commands.append(
+            {
+                "command": alias,
+                "description": f"Run Claude /{command_name}"[:256],
+            }
+        )
+        slash_aliases[f"/{alias}"] = f"/{command_name}"
+
+    return commands, slash_aliases
+
+
+BOT_COMMANDS, PROVIDER_SLASH_ALIASES = build_bot_commands()
 STATE_LOCK = threading.RLock()
 REQUESTS_LOCK = threading.RLock()
 MEDIA_GROUPS_LOCK = threading.RLock()
 ACTIVE_REQUESTS: dict[int, dict] = {}
 PENDING_MEDIA_GROUPS: dict[str, dict] = {}
+
+
+def default_state() -> dict:
+    return {
+        "offset": 0,
+        "sessions": {},
+        "user_settings": {},
+        "uploads": {},
+        "latest_debug_traces": {},
+        "github_actions": {
+            "subscriptions": {},
+            "selection_cache": {},
+            "known_runs": {},
+            "initialized": False,
+        },
+    }
+
+
+def normalize_state(raw_state: dict | None) -> dict:
+    state = raw_state if isinstance(raw_state, dict) else {}
+    normalized = default_state()
+
+    if isinstance(state.get("offset"), int):
+        normalized["offset"] = state["offset"]
+
+    for key in ["sessions", "user_settings", "uploads", "latest_debug_traces"]:
+        value = state.get(key)
+        if isinstance(value, dict):
+            normalized[key] = value
+
+    github_actions = state.get("github_actions")
+    if isinstance(github_actions, dict):
+        normalized_actions = normalized["github_actions"]
+        for key in ["subscriptions", "selection_cache", "known_runs"]:
+            value = github_actions.get(key)
+            if isinstance(value, dict):
+                normalized_actions[key] = value
+        if isinstance(github_actions.get("initialized"), bool):
+            normalized_actions["initialized"] = github_actions["initialized"]
+
+    return normalized
+
+
+def read_state_file(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    return normalize_state(json.loads(path.read_text(encoding="utf-8")))
+
+
+def write_state_file(path: Path, state: dict) -> None:
+    serialized = json.dumps(normalize_state(state), ensure_ascii=False)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        handle.write(serialized)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
 
 TECHNICAL_LINE_PATTERNS = [
     re.compile(r"^\s*[●◦○◆].*"),
@@ -514,12 +745,12 @@ def get_active_request(user_id: int) -> dict | None:
         return ACTIVE_REQUESTS.get(user_id)
 
 
-def start_active_request(user_id: int, chat_id: int, message: dict) -> dict:
+def start_active_request(user_id: int, chat_id: int, message: dict, verbose_enabled: bool = False) -> dict:
     request = {
         "chat_id": chat_id,
         "message": message,
         "raw_blocks": [],
-        "debug_enabled": False,
+        "debug_enabled": bool(verbose_enabled),
         "process": None,
         "cancel_requested": False,
         "started_at": int(time.time()),
@@ -977,17 +1208,29 @@ def download_telegram_file(file_id: str, preferred_name: str | None = None, file
 
 def load_state() -> dict:
     with STATE_LOCK:
-        if not STATE_PATH.exists():
-            return {"offset": 0, "sessions": {}}
         try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {"offset": 0, "sessions": {}}
+            state = read_state_file(STATE_PATH)
+            if state is not None:
+                return state
+        except Exception as error:
+            print(f"bridge warning: failed to load {STATE_PATH.name}: {error}", file=sys.stderr, flush=True)
+
+        try:
+            backup_state = read_state_file(STATE_BACKUP_PATH)
+            if backup_state is not None:
+                write_state_file(STATE_PATH, backup_state)
+                return backup_state
+        except Exception as error:
+            print(f"bridge warning: failed to load {STATE_BACKUP_PATH.name}: {error}", file=sys.stderr, flush=True)
+
+        return default_state()
 
 
 def save_state(state: dict) -> None:
     with STATE_LOCK:
-        STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
+        normalized_state = normalize_state(state)
+        write_state_file(STATE_PATH, normalized_state)
+        write_state_file(STATE_BACKUP_PATH, normalized_state)
 
 
 def get_session_state(state: dict, user_id: int) -> dict:
@@ -996,6 +1239,58 @@ def get_session_state(state: dict, user_id: int) -> dict:
     if session_key not in sessions:
         sessions[session_key] = {"has_session": False}
     return sessions[session_key]
+
+
+def get_user_settings(state: dict, user_id: int) -> dict:
+    settings = state.setdefault("user_settings", {})
+    key = str(user_id)
+    raw = settings.get(key)
+    if not isinstance(raw, dict):
+        raw = {}
+        settings[key] = raw
+    return raw
+
+
+def get_user_verbose_override(state: dict, user_id: int) -> bool | None:
+    settings = get_user_settings(state, user_id)
+    value = settings.get("verbose")
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def get_user_verbose_mode(state: dict, user_id: int) -> bool:
+    override = get_user_verbose_override(state, user_id)
+    if override is None:
+        return DEFAULT_VERBOSE
+    return override
+
+
+def set_user_verbose_override(state: dict, user_id: int, value: bool | None) -> None:
+    settings = state.setdefault("user_settings", {})
+    key = str(user_id)
+    raw = settings.get(key)
+    if not isinstance(raw, dict):
+        raw = {}
+    if value is None:
+        raw.pop("verbose", None)
+    else:
+        raw["verbose"] = bool(value)
+    if raw:
+        settings[key] = raw
+    else:
+        settings.pop(key, None)
+    save_state(state)
+
+
+def verbose_mode_status_text(state: dict, user_id: int) -> str:
+    override = get_user_verbose_override(state, user_id)
+    effective = get_user_verbose_mode(state, user_id)
+    source = "user override" if override is not None else "default"
+    return (
+        f"Verbose mode is {'ON' if effective else 'OFF'} ({source}).\n"
+        "Use /verbose on, /verbose off, /verbose toggle, or /verbose default."
+    )
 
 
 def get_latest_debug_trace(state: dict, user_id: int) -> str | None:
@@ -1053,12 +1348,14 @@ def help_text() -> str:
     command_lines = "\n".join(
         f"/{item['command']} - {item['description']}" for item in BOT_COMMANDS
     )
+    assistant_name = provider_name()
     return (
-        "Telegram Copilot Bridge\n\n"
+        f"Telegram {assistant_name} Bridge\n\n"
         f"Repo: {REPO_PATH}\n\n"
         f"Commands:\n{command_lines}\n\n"
-        "Any plain text message is sent to Copilot in the configured repository.\n"
-        "Telegram shows a human-readable summary by default. Use /debug if you want the full technical trace.\n\n"
+        f"Any plain text message is sent to {assistant_name} in the configured repository.\n"
+        f"Telegram default output mode: {'verbose technical trace' if DEFAULT_VERBOSE else 'human-readable summary'}. "
+        "Use /debug if you want the full technical trace.\n\n"
         "GitHub Actions subscriptions are managed per chat: use /actions, then /watch <number>.\n\n"
         "In group chats, the bot responds only to allowed users who mention @"
         f"{BOT_USERNAME}, use a command like /status@{BOT_USERNAME}, or reply directly to the bot."
@@ -1083,6 +1380,9 @@ def status_text(state: dict, user_id: int) -> str:
     chat_count = len(subscriptions)
     return (
         "Bridge is running\n\n"
+        f"Provider: {provider_name()} ({provider_bin()})\n"
+        f"Default verbose mode: {'on' if DEFAULT_VERBOSE else 'off'}\n"
+        f"Your verbose mode: {'on' if get_user_verbose_mode(state, user_id) else 'off'}\n"
         f"Repo: {REPO_PATH}\n"
         f"Branch: {branch}\n"
         f"GitHub Actions repo: {repo_slug}\n"
@@ -1276,12 +1576,16 @@ def run_upload_tool(local_path: Path, upload_name: str) -> tuple[bool, str]:
     return True, upload_result_text(parsed)
 
 
-def build_copilot_env() -> dict[str, str]:
+def build_ai_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("GITHUB_ACTIONS_TOKEN", None)
     if GITHUB_API_TOKEN and env.get("GITHUB_TOKEN", "").strip() == GITHUB_API_TOKEN:
         env.pop("GITHUB_TOKEN", None)
     return env
+
+
+def build_copilot_env() -> dict[str, str]:
+    return build_ai_env()
 
 
 def terminate_process(process: subprocess.Popen) -> None:
@@ -1437,17 +1741,30 @@ def handle_pending_upload(message: dict, state: dict, upload_session: dict) -> b
 
 
 def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool, bool, str]:
-    command = [COPILOT_BIN]
-    if continue_session:
-        command.append("--continue")
-    command.extend([
-        "-p",
-        prompt,
-        "--allow-all-tools",
-        "--no-color",
-        "--add-dir",
-        str(UPLOAD_DIR),
-    ])
+    command = [provider_bin()]
+    if AI_PROVIDER == "claude":
+        if continue_session:
+            command.append("--continue")
+        command.extend([
+            "--print",
+            prompt,
+            "--output-format",
+            "text",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            str(UPLOAD_DIR),
+        ])
+    else:
+        if continue_session:
+            command.append("--continue")
+        command.extend([
+            "-p",
+            prompt,
+            "--allow-all-tools",
+            "--no-color",
+            "--add-dir",
+            str(UPLOAD_DIR),
+        ])
     process = subprocess.Popen(
         command,
         cwd=REPO_PATH,
@@ -1455,7 +1772,7 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        env=build_copilot_env(),
+        env=build_ai_env(),
     )
     worker = threading.current_thread()
     user_id = getattr(worker, "user_id", None)
@@ -1533,17 +1850,19 @@ def extract_prompt(text: str) -> tuple[str | None, bool]:
     stripped = text.strip()
     if not stripped:
         return None, False
-    if stripped.startswith("/copilot"):
-        prompt = stripped[len("/copilot"):].strip()
-        return prompt or None, True
-    if stripped.startswith("/") and "@" in stripped.split()[0]:
-        command, _, remainder = stripped.partition(" ")
-        normalized = normalize_command_token(command)
-        if normalized == "/copilot":
+    if stripped.startswith("/"):
+        command_token, _, remainder = stripped.partition(" ")
+        normalized = normalize_command_token(command_token)
+        if not normalized:
+            return None, False
+        if normalized in {"/copilot", "/claude", f"/{AI_PROVIDER}"}:
             prompt = remainder.strip()
             return prompt or None, True
-        return None, False
-    if stripped.startswith("/"):
+        provider_slash = PROVIDER_SLASH_ALIASES.get(normalized)
+        if provider_slash:
+            argument = remainder.strip()
+            prompt = f"{provider_slash} {argument}".strip()
+            return prompt, True
         return None, False
     if BOT_USERNAME:
         stripped = re.sub(rf"(?i)@{re.escape(BOT_USERNAME)}\b[:,\-]?\s*", "", stripped).strip()
@@ -1580,7 +1899,7 @@ def handle_debug_command(message: dict, state: dict) -> None:
 
 
 def process_copilot_request(state: dict, message: dict, prompt: str, continue_session: bool, user_id: int, chat_id: int) -> None:
-    request = start_active_request(user_id, chat_id, message)
+    request = start_active_request(user_id, chat_id, message, get_user_verbose_mode(state, user_id))
     send_typing(chat_id)
     send_message(chat_id, "Working...")
     worker = threading.current_thread()
@@ -1614,7 +1933,7 @@ def process_copilot_request(state: dict, message: dict, prompt: str, continue_se
     save_state(state)
 
     if completed_request.get("cancel_requested") or result == "Request was cancelled.":
-        send_message(chat_id, "Cancelled the active request and reset your Copilot session. You can start a new one now.")
+        send_message(chat_id, f"Cancelled the active request and reset your {provider_name()} session. You can start a new one now.")
         send_group_done_ack(chat_id, message)
         return
 
@@ -1672,6 +1991,47 @@ def handle_message(message: dict, state: dict) -> None:
     if command == "/debug":
         handle_debug_command(message, state)
         return
+    if command == "/verbose":
+        argument = parse_command_argument(get_message_text(message)).strip().lower()
+        if not argument:
+            send_message(chat_id, verbose_mode_status_text(state, user_id))
+            send_group_done_ack(chat_id, message)
+            return
+
+        if argument in {"on", "true", "1", "yes"}:
+            set_user_verbose_override(state, user_id, True)
+            send_message(chat_id, "Verbose mode is now ON for your new requests.")
+            send_group_done_ack(chat_id, message)
+            return
+
+        if argument in {"off", "false", "0", "no"}:
+            set_user_verbose_override(state, user_id, False)
+            send_message(chat_id, "Verbose mode is now OFF for your new requests.")
+            send_group_done_ack(chat_id, message)
+            return
+
+        if argument == "toggle":
+            current = get_user_verbose_mode(state, user_id)
+            set_user_verbose_override(state, user_id, not current)
+            send_message(chat_id, f"Verbose mode is now {'ON' if not current else 'OFF'} for your new requests.")
+            send_group_done_ack(chat_id, message)
+            return
+
+        if argument == "default":
+            set_user_verbose_override(state, user_id, None)
+            send_message(
+                chat_id,
+                (
+                    "Verbose mode reset to the global default "
+                    f"({'ON' if DEFAULT_VERBOSE else 'OFF'})."
+                ),
+            )
+            send_group_done_ack(chat_id, message)
+            return
+
+        send_message(chat_id, "Unknown value. Use /verbose on, /verbose off, /verbose toggle, or /verbose default.")
+        send_group_done_ack(chat_id, message)
+        return
     if command == "/cancel":
         active_request = get_active_request(user_id)
         if active_request:
@@ -1687,7 +2047,7 @@ def handle_message(message: dict, state: dict) -> None:
             return
         session_state["has_session"] = False
         save_state(state)
-        send_message(chat_id, "Started a fresh Copilot thread for your account.")
+        send_message(chat_id, f"Started a fresh {provider_name()} thread for your account.")
         send_group_done_ack(chat_id, message)
         return
     if command == "/status":
@@ -1751,7 +2111,7 @@ def handle_message(message: dict, state: dict) -> None:
         send_group_done_ack(chat_id, message)
         return
     if not prompt:
-        send_message(chat_id, "Send text after /copilot, or just send a plain message.")
+        send_message(chat_id, f"Send text after /{AI_PROVIDER}, or just send a plain message.")
         send_group_done_ack(chat_id, message)
         return
 
