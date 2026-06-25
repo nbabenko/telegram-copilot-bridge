@@ -68,20 +68,54 @@ if AI_PROVIDER not in {"copilot", "claude"}:
     print(f"bridge warning: unsupported AI_PROVIDER={AI_PROVIDER!r}; falling back to 'copilot'", file=sys.stderr, flush=True)
     AI_PROVIDER = "copilot"
 
+GITHUB_ACTIONS_REQUIRED_ENV_KEYS = [
+    "GITHUB_ACTIONS_REPO",
+    "GITHUB_ACTIONS_TOKEN",
+    "GITHUB_POLL_INTERVAL",
+]
+OBJECT_STORAGE_REQUIRED_ENV_KEYS = [
+    "OBJECT_STORAGE_ENDPOINT",
+    "OBJECT_STORAGE_BUCKET",
+    "OBJECT_STORAGE_ACCESS_KEY_ID",
+    "OBJECT_STORAGE_SECRET_ACCESS_KEY",
+    "OBJECT_STORAGE_REGION",
+    "OBJECT_STORAGE_PUBLIC_BASE_URL",
+    "OBJECT_STORAGE_PREFIX",
+]
 
-STATIC_BOT_COMMANDS = [
+
+def missing_required_env(keys: list[str]) -> list[str]:
+    missing: list[str] = []
+    for key in keys:
+        value = os.environ.get(key)
+        if value is None or not str(value).strip():
+            missing.append(key)
+    return missing
+
+
+MISSING_GITHUB_ACTIONS_ENV = missing_required_env(GITHUB_ACTIONS_REQUIRED_ENV_KEYS)
+MISSING_OBJECT_STORAGE_ENV = missing_required_env(OBJECT_STORAGE_REQUIRED_ENV_KEYS)
+GITHUB_ACTIONS_ENABLED = not MISSING_GITHUB_ACTIONS_ENV
+OBJECT_STORAGE_ENABLED = not MISSING_OBJECT_STORAGE_ENV
+
+
+BASE_STATIC_BOT_COMMANDS = [
     {"command": "start", "description": "Show help and quick start"},
     {"command": "help", "description": "Show help and commands"},
     {"command": "new", "description": "Start a fresh assistant thread"},
     {"command": "status", "description": "Show bridge and session status"},
+    {"command": "debug", "description": "Show or enable full technical trace"},
+    {"command": "verbose", "description": "Toggle default verbose mode for your requests"},
+    {"command": "cancel", "description": "Cancel a pending upload or active request"},
+]
+GITHUB_ACTIONS_COMMANDS = [
     {"command": "actions", "description": "List GitHub Actions workflows"},
     {"command": "subscriptions", "description": "Show this chat's workflow subscriptions"},
     {"command": "watch", "description": "Subscribe this chat to a workflow"},
     {"command": "unwatch", "description": "Unsubscribe this chat from a workflow"},
+]
+UPLOAD_COMMANDS = [
     {"command": "upload", "description": "Upload Telegram media to object storage"},
-    {"command": "debug", "description": "Show or enable full technical trace"},
-    {"command": "verbose", "description": "Toggle default verbose mode for your requests"},
-    {"command": "cancel", "description": "Cancel a pending upload or active request"},
 ]
 EXPLICIT_PROMPT_COMMANDS = {
     "copilot": "Send an explicit prompt to Copilot",
@@ -215,7 +249,11 @@ def discover_dynamic_provider_commands() -> list[str]:
 
 
 def build_bot_commands() -> tuple[list[dict], dict[str, str]]:
-    commands = list(STATIC_BOT_COMMANDS)
+    commands = list(BASE_STATIC_BOT_COMMANDS)
+    if GITHUB_ACTIONS_ENABLED:
+        commands.extend(GITHUB_ACTIONS_COMMANDS)
+    if OBJECT_STORAGE_ENABLED:
+        commands.extend(UPLOAD_COMMANDS)
     provider_prompt_command = AI_PROVIDER
     commands.append(
         {
@@ -1349,6 +1387,16 @@ def help_text() -> str:
         f"/{item['command']} - {item['description']}" for item in BOT_COMMANDS
     )
     assistant_name = provider_name()
+    actions_line = (
+        "GitHub Actions subscriptions are managed per chat: use /actions, then /watch <number>.\n\n"
+        if GITHUB_ACTIONS_ENABLED
+        else "GitHub Actions integration is disabled until required env variables are set.\n\n"
+    )
+    upload_line = (
+        "Object storage upload is enabled: use /upload for media upload flow.\n\n"
+        if OBJECT_STORAGE_ENABLED
+        else "Object storage upload is disabled until required env variables are set.\n\n"
+    )
     return (
         f"Telegram {assistant_name} Bridge\n\n"
         f"Repo: {REPO_PATH}\n\n"
@@ -1356,7 +1404,8 @@ def help_text() -> str:
         f"Any plain text message is sent to {assistant_name} in the configured repository.\n"
         f"Telegram default output mode: {'verbose technical trace' if DEFAULT_VERBOSE else 'human-readable summary'}. "
         "Use /debug if you want the full technical trace.\n\n"
-        "GitHub Actions subscriptions are managed per chat: use /actions, then /watch <number>.\n\n"
+        f"{actions_line}"
+        f"{upload_line}"
         "In group chats, the bot responds only to allowed users who mention @"
         f"{BOT_USERNAME}, use a command like /status@{BOT_USERNAME}, or reply directly to the bot."
     )
@@ -1385,8 +1434,10 @@ def status_text(state: dict, user_id: int) -> str:
         f"Your verbose mode: {'on' if get_user_verbose_mode(state, user_id) else 'off'}\n"
         f"Repo: {REPO_PATH}\n"
         f"Branch: {branch}\n"
+        f"GitHub Actions: {'enabled' if GITHUB_ACTIONS_ENABLED else 'disabled'}\n"
         f"GitHub Actions repo: {repo_slug}\n"
         f"Action subscription chats: {chat_count}\n"
+        f"Object storage upload: {'enabled' if OBJECT_STORAGE_ENABLED else 'disabled'}\n"
         f"Whitelisted users: {len(ALLOWED_USER_IDS)}\n"
         f"Session state: {'continuing' if session_state.get('has_session') else 'new'}\n"
         f"Active request: {'yes' if get_active_request(user_id) else 'no'}\n"
@@ -1395,6 +1446,9 @@ def status_text(state: dict, user_id: int) -> str:
 
 
 def fetch_actions_repo_and_workflows() -> tuple[str | None, list[dict], str | None]:
+    if not GITHUB_ACTIONS_ENABLED:
+        missing = ", ".join(MISSING_GITHUB_ACTIONS_ENV)
+        return None, [], f"GitHub Actions integration is disabled. Missing env vars: {missing}"
     repo_slug = resolve_github_actions_repo()
     if not repo_slug:
         return None, [], (
@@ -1548,6 +1602,9 @@ def upload_result_text(result: dict) -> str:
 
 
 def run_upload_tool(local_path: Path, upload_name: str) -> tuple[bool, str]:
+    if not OBJECT_STORAGE_ENABLED:
+        missing = ", ".join(MISSING_OBJECT_STORAGE_ENV)
+        return False, f"Object storage upload is disabled. Missing env vars: {missing}"
     if not UPLOAD_TOOL.exists():
         return False, f"Upload helper not found at {UPLOAD_TOOL}"
 
@@ -1694,6 +1751,11 @@ def handle_pending_upload(message: dict, state: dict, upload_session: dict) -> b
     user_id = message["from"]["id"]
     text = get_message_text(message).strip()
     command = normalize_command_token(text.split()[0]) if text.startswith("/") else ""
+
+    if not OBJECT_STORAGE_ENABLED:
+        clear_upload_session(state, user_id, cleanup_local_file=True)
+        send_message(chat_id, f"Object storage upload is disabled. Missing env vars: {', '.join(MISSING_OBJECT_STORAGE_ENV)}")
+        return True
 
     if upload_session.get("chat_id") != chat_id:
         return False
@@ -1973,18 +2035,34 @@ def handle_message(message: dict, state: dict) -> None:
         send_group_done_ack(chat_id, message)
         return
     if command == "/actions":
+        if not GITHUB_ACTIONS_ENABLED:
+            send_message(chat_id, f"GitHub Actions integration is disabled. Missing env vars: {', '.join(MISSING_GITHUB_ACTIONS_ENV)}")
+            send_group_done_ack(chat_id, message)
+            return
         handle_actions_command(message, state)
         send_group_done_ack(chat_id, message)
         return
     if command == "/subscriptions":
+        if not GITHUB_ACTIONS_ENABLED:
+            send_message(chat_id, f"GitHub Actions integration is disabled. Missing env vars: {', '.join(MISSING_GITHUB_ACTIONS_ENV)}")
+            send_group_done_ack(chat_id, message)
+            return
         handle_subscriptions_command(message, state)
         send_group_done_ack(chat_id, message)
         return
     if command == "/watch":
+        if not GITHUB_ACTIONS_ENABLED:
+            send_message(chat_id, f"GitHub Actions integration is disabled. Missing env vars: {', '.join(MISSING_GITHUB_ACTIONS_ENV)}")
+            send_group_done_ack(chat_id, message)
+            return
         handle_watch_command(message, state)
         send_group_done_ack(chat_id, message)
         return
     if command == "/unwatch":
+        if not GITHUB_ACTIONS_ENABLED:
+            send_message(chat_id, f"GitHub Actions integration is disabled. Missing env vars: {', '.join(MISSING_GITHUB_ACTIONS_ENV)}")
+            send_group_done_ack(chat_id, message)
+            return
         handle_unwatch_command(message, state)
         send_group_done_ack(chat_id, message)
         return
@@ -2055,6 +2133,10 @@ def handle_message(message: dict, state: dict) -> None:
         send_group_done_ack(chat_id, message)
         return
     if command == "/upload":
+        if not OBJECT_STORAGE_ENABLED:
+            send_message(chat_id, f"Object storage upload is disabled. Missing env vars: {', '.join(MISSING_OBJECT_STORAGE_ENV)}")
+            send_group_done_ack(chat_id, message)
+            return
         current_attachment = get_message_attachments(message)
         reply_message = message.get("reply_to_message")
         reply_attachment = get_message_attachments(reply_message) if reply_message else []
@@ -2139,6 +2221,8 @@ def handle_message(message: dict, state: dict) -> None:
 
 
 def poll_github_action_updates(state: dict) -> None:
+    if not GITHUB_ACTIONS_ENABLED:
+        return
     while True:
         try:
             repo_slug = resolve_github_actions_repo()
@@ -2241,9 +2325,22 @@ def poll_github_action_updates(state: dict) -> None:
 def main() -> int:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    if not GITHUB_ACTIONS_ENABLED:
+        print(
+            f"bridge info: GitHub Actions integration disabled (missing: {', '.join(MISSING_GITHUB_ACTIONS_ENV)})",
+            file=sys.stderr,
+            flush=True,
+        )
+    if not OBJECT_STORAGE_ENABLED:
+        print(
+            f"bridge info: object storage upload disabled (missing: {', '.join(MISSING_OBJECT_STORAGE_ENV)})",
+            file=sys.stderr,
+            flush=True,
+        )
     sync_bot_commands_safe()
     state = load_state()
-    threading.Thread(target=poll_github_action_updates, args=(state,), daemon=True).start()
+    if GITHUB_ACTIONS_ENABLED:
+        threading.Thread(target=poll_github_action_updates, args=(state,), daemon=True).start()
     while True:
         try:
             updates = telegram_request(

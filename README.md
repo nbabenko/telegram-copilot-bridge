@@ -9,9 +9,9 @@ Minimal Telegram bot that forwards plain text messages to a local AI CLI (GitHub
 - Runs the configured AI CLI inside a configured repository
 - Continues AI session context per Telegram user
 - Returns a human-readable summary by default and exposes the full technical trace through `/debug`
-- Includes replied-to Telegram message text and attachments as Copilot context
-- Accepts `/upload`, asks for a storage name, and uploads Telegram media without overwriting existing names
-- Lists GitHub Actions workflows and lets each chat subscribe to start and finish notifications
+- Includes replied-to Telegram message text and attachments as assistant context
+- Optionally accepts `/upload`, asks for a storage name, and uploads Telegram media without overwriting existing names
+- Optionally lists GitHub Actions workflows and lets each chat subscribe to start and finish notifications
 
 ## Requirements
 
@@ -21,7 +21,7 @@ Minimal Telegram bot that forwards plain text messages to a local AI CLI (GitHub
 - GitHub Copilot CLI or Claude CLI installed and authenticated
 - A Telegram bot token from BotFather
 - At least one Telegram numeric user ID to whitelist
-- Object storage credentials for uploads
+- Optional object storage credentials for uploads
 - `ffmpeg` if `.mov` inputs should be converted to MP4 automatically
 - Optional GitHub token if the watched repository is private or you want higher API rate limits
 
@@ -43,13 +43,11 @@ Minimal Telegram bot that forwards plain text messages to a local AI CLI (GitHub
   - set `REPO_PATH`
   - set `AI_PROVIDER` to `copilot` or `claude`
   - set `COPILOT_BIN` and/or `CLAUDE_BIN`
-  - set `UPLOAD_DIR` to a folder inside the target repository if you want uploaded files to be readable by Copilot without extra path permissions
+  - set `UPLOAD_DIR` to a folder inside the target repository if you want uploaded files to be readable by the assistant without extra path permissions
   - optional for Claude: set `CLAUDE_COMMANDS_DISCOVERY_CMD` and `CLAUDE_COMMANDS_DIRS` to expose Claude slash commands as Telegram bot commands
   - optional: set `DEFAULT_VERBOSE=true` to stream technical trace by default instead of user-facing summary
-  - set the `OBJECT_STORAGE_*` variables if `/upload` should work
-  - optionally set `GITHUB_ACTIONS_REPO=owner/repo`; if omitted, the bridge derives it from the `origin` remote of `REPO_PATH`
-  - optionally set `GITHUB_ACTIONS_TOKEN` for private repositories or higher rate limits
-  - optionally set `GITHUB_POLL_INTERVAL` to control how often workflow runs are checked
+  - optional: GitHub Actions integration is enabled only when all are set: `GITHUB_ACTIONS_REPO`, `GITHUB_ACTIONS_TOKEN`, `GITHUB_POLL_INTERVAL`
+  - optional: object storage upload is enabled only when all are set: `OBJECT_STORAGE_ENDPOINT`, `OBJECT_STORAGE_BUCKET`, `OBJECT_STORAGE_ACCESS_KEY_ID`, `OBJECT_STORAGE_SECRET_ACCESS_KEY`, `OBJECT_STORAGE_REGION`, `OBJECT_STORAGE_PUBLIC_BASE_URL`, `OBJECT_STORAGE_PREFIX`
 4. Install the upload-helper dependency:
 
 ```bash
@@ -75,13 +73,13 @@ python3 bot.py
 - `/help` - show help
 - `/new` - start a fresh assistant thread for the current Telegram account
 - `/status` - show repo and session status
-- `/actions` - list GitHub Actions workflows for the configured repository
-- `/subscriptions` - show the current chat's workflow subscriptions
-- `/watch <number|name>` - subscribe the current chat to a workflow
-- `/unwatch <number|name|all>` - stop workflow notifications in the current chat
+- `/actions` - list GitHub Actions workflows for the configured repository (when enabled)
+- `/subscriptions` - show the current chat's workflow subscriptions (when enabled)
+- `/watch <number|name>` - subscribe the current chat to a workflow (when enabled)
+- `/unwatch <number|name|all>` - stop workflow notifications in the current chat (when enabled)
 - `/debug` - show the latest full technical trace or attach to the current request trace
 - `/verbose [on|off|toggle|default]` - control whether your new requests start in verbose technical mode
-- `/upload` - upload Telegram media to object storage after you provide a name
+- `/upload` - upload Telegram media to object storage after you provide a name (when enabled)
 - `/cancel` - cancel a pending upload or stop the active AI request
 - `/copilot <prompt>` - explicit Copilot prompt (always accepted)
 - `/claude <prompt>` - explicit Claude prompt (always accepted)
@@ -93,6 +91,8 @@ When `AI_PROVIDER=claude`, the bridge also discovers Claude slash commands and m
 ## GitHub Actions Notifications
 
 Workflow subscriptions are scoped per chat.
+
+If required GitHub Actions env vars are missing, this functionality is skipped: Actions commands are omitted from Telegram bot commands, polling is not started, and runtime command handlers return a disabled message.
 
 - in a private chat, notifications come back to that direct message
 - in a group chat, notifications are posted into that group
@@ -124,7 +124,7 @@ Use `/debug` in one of two ways:
 - if a request is currently running, `/debug` replays the full technical trace from the start and keeps streaming technical details until that request finishes
 - if no request is running, `/debug` returns the full technical trace for your latest completed reply
 
-If a request is still running and you want to stop it, use `/cancel`. The bridge will terminate the active Copilot subprocess, reset your per-user session state, and let you start a fresh request immediately.
+If a request is still running and you want to stop it, use `/cancel`. The bridge will terminate the active assistant subprocess, reset your per-user session state, and let you start a fresh request immediately.
 
 This keeps ordinary chats readable while preserving a way to inspect the raw execution details when needed.
 ## File Uploads
@@ -133,7 +133,7 @@ The bridge can process Telegram attachments such as documents and photos.
 
 - uploads are downloaded locally before the AI CLI is called
 - the downloaded path is appended to the AI prompt
-- if a Telegram album contains multiple images or files in one message group, the bridge waits briefly, collects the whole group, and appends every downloaded local path to one Copilot request
+- if a Telegram album contains multiple images or files in one message group, the bridge waits briefly, collects the whole group, and appends every downloaded local path to one assistant request
 - by default, uploads are stored in `.telegram-copilot-uploads/` inside the configured repository
 - the bridge also passes `--add-dir` for that upload directory to the selected CLI
 - Telegram Bot API downloads are limited to 20 MB; larger Telegram media now fail with an explicit size-related error instead of a generic HTTP 400
@@ -142,11 +142,13 @@ This keeps file paths accessible without requiring manual approval for unrelated
 
 ## Storage Uploads
 
-`/upload` is separate from the Copilot flow.
+`/upload` is separate from the assistant flow.
+
+If required object storage env vars are missing, this functionality is skipped: `/upload` is omitted from Telegram bot commands and runtime upload handlers return a disabled message.
 
 - send `/upload` with attached media, or reply `/upload` to a Telegram message that already has media
 - if you send `/upload` without media first, the bridge waits for your next media message
-- `/upload` currently accepts one media file at a time; albums should be handled through the Copilot flow instead of the storage-upload flow
+- `/upload` currently accepts one media file at a time; albums should be handled through the assistant flow instead of the storage-upload flow
 - after the file is downloaded locally, the bridge asks for a storage name
 - the upload helper refuses to overwrite an existing object key
 - `.mov` files are converted to `.mp4` with `ffmpeg` before upload
@@ -164,7 +166,7 @@ In groups, it responds only when the sender is whitelisted and one of these is t
 - the message uses a bot-addressed command such as `/status@your_bot_name`
 - the message is a reply to one of the bot's own messages
 
-When you reply to another Telegram message and mention the bot, the bridge now appends the referenced message text and any referenced attachment path to the Copilot prompt.
+When you reply to another Telegram message and mention the bot, the bridge now appends the referenced message text and any referenced attachment path to the assistant prompt.
 
 No Telegram setting change is required for reply-context support if you already mention the bot when replying.
 
