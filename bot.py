@@ -489,7 +489,7 @@ def edit_message_reply_markup(chat_id: int, message_id: int, keyboard: list[list
     payload = {
         "chat_id": str(chat_id),
         "message_id": str(message_id),
-        "reply_markup": json.dumps({"inline_keyboard": keyboard or []}),
+        "reply_markup": json.dumps({"inline_keyboard": keyboard}) if keyboard is not None else "{}",
     }
     try:
         telegram_request("editMessageReplyMarkup", payload)
@@ -500,7 +500,8 @@ def edit_message_reply_markup(chat_id: int, message_id: int, keyboard: list[list
                 body = error.read().decode("utf-8", errors="replace")  # type: ignore[union-attr]
             except Exception:
                 pass
-        print(f"bridge warning: editMessageReplyMarkup failed: {error} {body}".strip(), file=sys.stderr, flush=True)
+        if "not modified" not in body:
+            print(f"bridge warning: editMessageReplyMarkup failed: {error} {body}".strip(), file=sys.stderr, flush=True)
 
 
 def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
