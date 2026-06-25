@@ -1849,11 +1849,13 @@ def handle_pending_upload(message: dict, state: dict, upload_session: dict) -> b
 def _parse_claude_stream_event(
     line: str,
     buffer: list[str],
+    text_buffer: list[str],
     permission_denials: list[dict],
 ) -> bool:
     """Parse one JSONL event from Claude's stream-json output.
 
-    Appends human-readable text to buffer and collects permission denials.
+    buffer receives text + tool-call annotations (for verbose live streaming).
+    text_buffer receives text only (for clean non-verbose summary).
     Returns True if the line was a recognised JSON event, False for raw text.
     """
     stripped = line.strip()
@@ -1863,6 +1865,7 @@ def _parse_claude_stream_event(
         event = json.loads(stripped)
     except json.JSONDecodeError:
         buffer.append(line)
+        text_buffer.append(line)
         return False
 
     event_type = event.get("type")
@@ -1872,12 +1875,13 @@ def _parse_claude_stream_event(
                 text = block.get("text", "")
                 if text:
                     buffer.append(text)
+                    text_buffer.append(text)
                     if not text.endswith("\n"):
                         buffer.append("\n")
+                        text_buffer.append("\n")
             elif block.get("type") == "tool_use":
                 name = block.get("name", "")
                 inp = block.get("input", {})
-                # Compact single-line representation for tool calls
                 if name == "Bash":
                     cmd = inp.get("command", "").strip().splitlines()
                     summary = cmd[0] if cmd else json.dumps(inp)
@@ -1886,6 +1890,7 @@ def _parse_claude_stream_event(
                     buffer.append(f"[{name}: {summary}]\n")
                 else:
                     buffer.append(f"[{name}: {json.dumps(inp, ensure_ascii=False)}]\n")
+                # tool annotations go to verbose buffer only, not text_buffer
     elif event_type == "result":
         permission_denials.extend(event.get("permission_denials") or [])
     return True
@@ -1896,10 +1901,11 @@ def stream_copilot(
     continue_session: bool,
     on_block,
     extra_allowed_tools: list[str] | None = None,
-) -> tuple[bool, bool, str, list[dict]]:
+) -> tuple[bool, bool, str, list[dict], str]:
     """Run Claude/Copilot and stream output via on_block.
 
-    Returns (success, sent_any, error_message, permission_denials).
+    Returns (success, sent_any, error_message, permission_denials, text_content).
+    text_content is clean text only (no tool annotations) for non-verbose summary.
     permission_denials is non-empty only when AI_PROVIDER=="claude" and Claude
     refused one or more tool calls due to missing permissions.
     """
@@ -1952,6 +1958,7 @@ def stream_copilot(
         return False, False, "Request state was lost before Copilot started.", []
     deadline = time.monotonic() + COPILOT_TIMEOUT
     buffer: list[str] = []
+    text_buffer: list[str] = []
     sent_any = False
     last_flush = time.monotonic()
     permission_denials: list[dict] = []
@@ -1974,11 +1981,11 @@ def stream_copilot(
             if active_request is None or active_request.get("cancel_requested"):
                 terminate_process(process)
                 flush_buffer()
-                return False, sent_any, "Request was cancelled.", []
+                return False, sent_any, "Request was cancelled.", [], ""
             if time.monotonic() > deadline:
                 terminate_process(process)
                 flush_buffer()
-                return False, sent_any, f"Timed out after {COPILOT_TIMEOUT} seconds.", []
+                return False, sent_any, f"Timed out after {COPILOT_TIMEOUT} seconds.", [], ""
 
             line = process.stdout.readline()
             if line == "" and process.poll() is not None:
@@ -1988,9 +1995,10 @@ def stream_copilot(
                 continue
 
             if AI_PROVIDER == "claude":
-                _parse_claude_stream_event(line, buffer, permission_denials)
+                _parse_claude_stream_event(line, buffer, text_buffer, permission_denials)
             else:
                 buffer.append(line)
+                text_buffer.append(line)
 
             current = "".join(buffer)
             if line.strip() == "" and len(current.strip()) >= STREAM_FLUSH_MIN_PARAGRAPH_LEN:
@@ -2006,17 +2014,18 @@ def stream_copilot(
     except Exception as error:
         terminate_process(process)
         flush_buffer()
-        return False, sent_any, str(error), []
+        return False, sent_any, str(error), [], ""
 
     flush_buffer()
+    text_content = "".join(text_buffer)
     active_request = get_active_request(user_id)
     if active_request is None or active_request.get("cancel_requested"):
-        return False, sent_any, "Request was cancelled.", []
+        return False, sent_any, "Request was cancelled.", [], ""
     if process.returncode == 0:
-        return True, sent_any, "", permission_denials
+        return True, sent_any, "", permission_denials, text_content
     if process.returncode in {-signal.SIGTERM, -signal.SIGKILL}:
-        return False, sent_any, "Request was cancelled.", []
-    return False, sent_any, f"Exit code {process.returncode}", []
+        return False, sent_any, "Request was cancelled.", [], ""
+    return False, sent_any, f"Exit code {process.returncode}", [], text_content
 
 
 def extract_prompt(text: str) -> tuple[str | None, bool]:
@@ -2100,7 +2109,7 @@ def process_copilot_request(
         if debug_enabled and debug_chat_id is not None:
             send_text_blocks(debug_chat_id, block)
 
-    success, sent_any, result, permission_denials = stream_copilot(
+    success, sent_any, result, permission_denials, text_content = stream_copilot(
         prompt, continue_session, on_block, extra_allowed_tools
     )
     completed_request = finish_active_request(user_id) or request
@@ -2112,11 +2121,17 @@ def process_copilot_request(
         session_state = get_session_state(state, user_id)
         session_state["has_session"] = True
         save_state(state)
-        summary_text = build_user_facing_text(raw_text)
-        if summary_text:
-            send_text_blocks(chat_id, summary_text)
-        elif not sent_any:
-            send_message(chat_id, "Task finished.")
+        verbose_mode = completed_request.get("debug_enabled", False)
+        if verbose_mode:
+            # Content was already streamed live; don't re-send as summary.
+            if not sent_any:
+                send_message(chat_id, "Task finished.")
+        else:
+            summary_text = build_user_facing_text(text_content)
+            if summary_text:
+                send_text_blocks(chat_id, summary_text)
+            elif not sent_any:
+                send_message(chat_id, "Task finished.")
 
         if permission_denials:
             # Task succeeded but some tools were blocked — offer retry with those tools allowed.
