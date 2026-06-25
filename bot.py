@@ -469,6 +469,17 @@ def answer_callback_query(callback_query_id: str, text: str | None = None) -> No
         pass
 
 
+def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
+    try:
+        telegram_request("editMessageText", {
+            "chat_id": str(chat_id),
+            "message_id": str(message_id),
+            "text": text,
+        })
+    except Exception:
+        pass
+
+
 def get_message_text(message: dict) -> str:
     return message.get("text") or message.get("caption") or ""
 
@@ -2175,7 +2186,9 @@ def process_copilot_request(
 def handle_callback_query(query: dict, state: dict) -> None:
     query_id = query.get("id", "")
     user_id = int((query.get("from") or {}).get("id", 0))
-    chat_id = int(((query.get("message") or {}).get("chat") or {}).get("id", 0))
+    query_message = query.get("message") or {}
+    chat_id = int((query_message.get("chat") or {}).get("id", 0))
+    message_id = int(query_message.get("message_id", 0))
     data = query.get("data", "")
 
     answer_callback_query(query_id)
@@ -2188,11 +2201,17 @@ def handle_callback_query(query: dict, state: dict) -> None:
     if data == f"perm_allow:{user_id}":
         pending = pop_pending_permission(user_id)
         if not pending:
-            send_message(chat_id, "This permission request has already been handled or has expired.")
+            if message_id:
+                edit_message_text(chat_id, message_id, "This permission request has already been handled or has expired.")
             return
         if get_active_request(user_id):
-            send_message(chat_id, busy_lock_text())
+            if message_id:
+                edit_message_text(chat_id, message_id, busy_lock_text())
             return
+        tool_names = sorted({d.get("tool_name", "") for d in (pending.get("denied_tools") or []) if d.get("tool_name")})
+        label = ", ".join(tool_names) if tool_names else "requested tools"
+        if message_id:
+            edit_message_text(chat_id, message_id, f"Allowed {label}. Retrying...")
         allowed_tools = pending.get("allowed_tools") or []
         worker = threading.Thread(
             target=process_copilot_request,
@@ -2211,7 +2230,8 @@ def handle_callback_query(query: dict, state: dict) -> None:
 
     elif data == f"perm_deny:{user_id}":
         pop_pending_permission(user_id)
-        send_message(chat_id, "Skipped. The previous response stands as-is.")
+        if message_id:
+            edit_message_text(chat_id, message_id, "Skipped. The previous response stands as-is.")
 
 
 def handle_message(message: dict, state: dict) -> None:
