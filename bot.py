@@ -104,11 +104,27 @@ BASE_STATIC_BOT_COMMANDS = [
     {"command": "start", "description": "Show help and quick start"},
     {"command": "help", "description": "Show help and commands"},
     {"command": "new", "description": "Start a fresh assistant thread"},
+    {"command": "login", "description": "Log in to Claude (shows auth URL)"},
     {"command": "status", "description": "Show bridge and session status"},
     {"command": "debug", "description": "Show or enable full technical trace"},
     {"command": "verbose", "description": "Toggle default verbose mode for your requests"},
     {"command": "cancel", "description": "Cancel a pending upload or active request"},
 ]
+
+CREDITS_LIMIT_PATTERNS = [
+    re.compile(r"session limit", re.IGNORECASE),
+    re.compile(r"credits?.*exhaust", re.IGNORECASE),
+    re.compile(r"run out of credits?", re.IGNORECASE),
+    re.compile(r"usage limit", re.IGNORECASE),
+    re.compile(r"billing", re.IGNORECASE),
+    re.compile(r"quota.*exceeded", re.IGNORECASE),
+    re.compile(r"account.*limit", re.IGNORECASE),
+    re.compile(r"resets?\s+\d", re.IGNORECASE),
+]
+
+
+def is_credits_limit_error(text: str) -> bool:
+    return any(p.search(text) for p in CREDITS_LIMIT_PATTERNS)
 GITHUB_ACTIONS_COMMANDS = [
     {"command": "actions", "description": "List GitHub Actions workflows"},
     {"command": "subscriptions", "description": "Show this chat's workflow subscriptions"},
@@ -2117,6 +2133,55 @@ def handle_debug_command(message: dict, state: dict) -> None:
     send_message(chat_id, "No active or recent request is available for debug.")
 
 
+def handle_login_command(message: dict) -> None:
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+
+    if get_active_request(user_id):
+        send_message(chat_id, busy_lock_text())
+        return
+
+    send_message(chat_id, "Starting Claude login...")
+
+    def run_login() -> None:
+        try:
+            process = subprocess.Popen(
+                [CLAUDE_BIN, "auth", "login"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                env=build_ai_env(),
+            )
+            assert process.stdout is not None
+            url_sent = False
+            for raw_line in process.stdout:
+                line = strip_ansi_sequences(raw_line).strip()
+                if not line:
+                    continue
+                url_match = re.search(r"https?://\S+", line)
+                if url_match and not url_sent:
+                    url = url_match.group(0).rstrip(")")
+                    send_message(chat_id, f"Open this URL to log in:\n{url}")
+                    url_sent = True
+                elif line and not url_match and "browser" not in line.lower():
+                    send_message(chat_id, line)
+            process.wait(timeout=300)
+            if process.returncode == 0:
+                send_message(chat_id, "Login successful! You can send requests now.")
+            else:
+                send_message(chat_id, "Login did not complete. Try /login again.")
+        except Exception as error:
+            send_message(chat_id, f"Login error: {error}")
+
+    threading.Thread(target=run_login, daemon=True).start()
+
+
+def _build_login_keyboard(user_id: int) -> list[list[dict]]:
+    return [[{"text": "🔑 Login to Claude", "callback_data": f"login:{user_id}"}]]
+
+
 def _build_permission_keyboard(user_id: int, denied_tools: list[dict]) -> list[list[dict]]:
     names = sorted({d.get("tool_name", "") for d in denied_tools if d.get("tool_name")})
     label = f"Allow {', '.join(names)} & retry" if names else "Allow all & retry"
@@ -2203,9 +2268,17 @@ def process_copilot_request(
         return
 
     if result:
-        send_message(chat_id, "The task failed. Use /debug to see the technical details.")
-        if completed_request.get("debug_enabled"):
-            send_text_blocks(chat_id, result)
+        all_output = text_content or raw_text
+        if is_credits_limit_error(all_output) or is_credits_limit_error(result):
+            send_message_with_keyboard(
+                chat_id,
+                "Claude hit a usage or session limit. Log in to continue (you can switch accounts).",
+                _build_login_keyboard(user_id),
+            )
+        else:
+            send_message(chat_id, "The task failed. Use /debug to see the technical details.")
+            if completed_request.get("debug_enabled"):
+                send_text_blocks(chat_id, result)
     send_group_done_ack(chat_id, message)
 
 
@@ -2258,6 +2331,12 @@ def handle_callback_query(query: dict, state: dict) -> None:
             edit_message_reply_markup(chat_id, message_id)  # remove buttons immediately
         pop_pending_permission(user_id)
         send_message(chat_id, "Skipped. The previous response stands as-is.")
+
+    elif data == f"login:{user_id}":
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id)  # remove buttons immediately
+        fake_message = {"chat": {"id": chat_id, "type": "private"}, "from": {"id": user_id}, "message_id": 0}
+        handle_login_command(fake_message)
 
 
 def handle_message(message: dict, state: dict) -> None:
@@ -2319,6 +2398,9 @@ def handle_message(message: dict, state: dict) -> None:
             return
         handle_unwatch_command(message, state)
         send_group_done_ack(chat_id, message)
+        return
+    if command == "/login":
+        handle_login_command(message)
         return
     if command == "/debug":
         handle_debug_command(message, state)
