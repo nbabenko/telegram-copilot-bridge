@@ -1912,6 +1912,7 @@ def stream_copilot(
             prompt,
             "--output-format",
             "stream-json",
+            "--verbose",
             "--add-dir",
             str(UPLOAD_DIR),
         ]
