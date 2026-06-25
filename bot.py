@@ -469,15 +469,41 @@ def answer_callback_query(callback_query_id: str, text: str | None = None) -> No
         pass
 
 
-def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
+def edit_message_reply_markup(chat_id: int, message_id: int, keyboard: list[list[dict]] | None = None) -> None:
+    payload = {
+        "chat_id": str(chat_id),
+        "message_id": str(message_id),
+        "reply_markup": json.dumps({"inline_keyboard": keyboard or []}),
+    }
     try:
-        telegram_request("editMessageText", {
-            "chat_id": str(chat_id),
-            "message_id": str(message_id),
-            "text": text,
-        })
-    except Exception:
-        pass
+        telegram_request("editMessageReplyMarkup", payload)
+    except Exception as error:
+        body = ""
+        if hasattr(error, "read"):
+            try:
+                body = error.read().decode("utf-8", errors="replace")  # type: ignore[union-attr]
+            except Exception:
+                pass
+        print(f"bridge warning: editMessageReplyMarkup failed: {error} {body}".strip(), file=sys.stderr, flush=True)
+
+
+def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
+    payload = {
+        "chat_id": str(chat_id),
+        "message_id": str(message_id),
+        "text": text,
+        "reply_markup": json.dumps({"inline_keyboard": []}),
+    }
+    try:
+        telegram_request("editMessageText", payload)
+    except Exception as error:
+        body = ""
+        if hasattr(error, "read"):
+            try:
+                body = error.read().decode("utf-8", errors="replace")  # type: ignore[union-attr]
+            except Exception:
+                pass
+        print(f"bridge warning: editMessageText failed: {error} {body}".strip(), file=sys.stderr, flush=True)
 
 
 def get_message_text(message: dict) -> str:
@@ -2199,19 +2225,18 @@ def handle_callback_query(query: dict, state: dict) -> None:
         return
 
     if data == f"perm_allow:{user_id}":
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id)  # remove buttons immediately
         pending = pop_pending_permission(user_id)
         if not pending:
-            if message_id:
-                edit_message_text(chat_id, message_id, "This permission request has already been handled or has expired.")
+            send_message(chat_id, "This permission request has already been handled or has expired.")
             return
         if get_active_request(user_id):
-            if message_id:
-                edit_message_text(chat_id, message_id, busy_lock_text())
+            send_message(chat_id, busy_lock_text())
             return
         tool_names = sorted({d.get("tool_name", "") for d in (pending.get("denied_tools") or []) if d.get("tool_name")})
         label = ", ".join(tool_names) if tool_names else "requested tools"
-        if message_id:
-            edit_message_text(chat_id, message_id, f"Allowed {label}. Retrying...")
+        send_message(chat_id, f"Allowed {label}. Retrying...")
         allowed_tools = pending.get("allowed_tools") or []
         worker = threading.Thread(
             target=process_copilot_request,
@@ -2229,9 +2254,10 @@ def handle_callback_query(query: dict, state: dict) -> None:
         worker.start()
 
     elif data == f"perm_deny:{user_id}":
-        pop_pending_permission(user_id)
         if message_id:
-            edit_message_text(chat_id, message_id, "Skipped. The previous response stands as-is.")
+            edit_message_reply_markup(chat_id, message_id)  # remove buttons immediately
+        pop_pending_permission(user_id)
+        send_message(chat_id, "Skipped. The previous response stands as-is.")
 
 
 def handle_message(message: dict, state: dict) -> None:
