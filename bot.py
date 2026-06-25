@@ -381,6 +381,118 @@ TECHNICAL_LINE_PATTERNS = [
     re.compile(r"^\s*Completed\s*$", re.IGNORECASE),
 ]
 
+TOOL_ICONS: dict[str, str] = {
+    "Bash": "🔧",
+    "Read": "📄",
+    "Write": "📝",
+    "Edit": "✏️",
+    "MultiEdit": "✏️",
+    "WebSearch": "🔍",
+    "WebFetch": "🌐",
+    "Task": "🤖",
+    "Agent": "🤖",
+    "Workflow": "⚡",
+    "TodoWrite": "📋",
+    "TodoRead": "📋",
+    "ToolSearch": "🔎",
+    "NotebookEdit": "📓",
+}
+
+
+def _tool_icon(name: str) -> str:
+    return TOOL_ICONS.get(name, "⚙️")
+
+
+def _format_tool_use_html(name: str, inp: dict) -> str:
+    icon = _tool_icon(name)
+    if name == "Bash":
+        cmd = inp.get("command", "").strip()
+        lines = cmd.splitlines()
+        first = html.escape(lines[0]) if lines else ""
+        extra = f" <i>(+{len(lines) - 1} lines)</i>" if len(lines) > 1 else ""
+        return f"{icon} <code>{first}</code>{extra}"
+    if name in {"Read", "Write", "Edit", "MultiEdit"}:
+        path = str(inp.get("file_path") or inp.get("path") or json.dumps(inp))
+        return f"{icon} <code>{html.escape(path)}</code>"
+    if name in {"WebSearch", "ToolSearch"}:
+        q = str(inp.get("query", json.dumps(inp)))
+        return f"{icon} <code>{html.escape(q)}</code>"
+    if name == "WebFetch":
+        url = str(inp.get("url", json.dumps(inp)))
+        return f"{icon} <code>{html.escape(url)}</code>"
+    if name in {"Task", "Agent"}:
+        desc = str(inp.get("description") or inp.get("prompt") or "")
+        if len(desc) > 80:
+            desc = desc[:77] + "…"
+        return f"{icon} <i>{html.escape(desc)}</i>"
+    summary = json.dumps(inp, ensure_ascii=False)
+    if len(summary) > 100:
+        summary = summary[:97] + "…"
+    return f"{icon} <b>{html.escape(name)}</b> <code>{html.escape(summary)}</code>"
+
+
+def _inline_md_to_html(text: str) -> str:
+    parts: list[str] = []
+    pattern = re.compile(
+        r"`([^`\n]+)`"        # inline code
+        r"|\*\*(.+?)\*\*"     # bold **
+        r"|__(.+?)__"         # bold __
+        r"|\*([^*\n]+)\*"     # italic *
+        r"|_([^_\n]+)_",      # italic _
+        re.DOTALL,
+    )
+    last = 0
+    for m in pattern.finditer(text):
+        parts.append(html.escape(text[last:m.start()]))
+        g = m.groups()
+        if g[0] is not None:
+            parts.append(f"<code>{html.escape(g[0])}</code>")
+        elif g[1] is not None:
+            parts.append(f"<b>{html.escape(g[1])}</b>")
+        elif g[2] is not None:
+            parts.append(f"<b>{html.escape(g[2])}</b>")
+        elif g[3] is not None:
+            parts.append(f"<i>{html.escape(g[3])}</i>")
+        elif g[4] is not None:
+            parts.append(f"<i>{html.escape(g[4])}</i>")
+        last = m.end()
+    parts.append(html.escape(text[last:]))
+    return "".join(parts)
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    lines = text.split("\n")
+    result: list[str] = []
+    in_code = False
+    code_lines: list[str] = []
+    for line in lines:
+        if line.startswith("```"):
+            if in_code:
+                result.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
+                code_lines.clear()
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+        heading = re.match(r"^(#{1,3})\s+(.*)", line)
+        if heading:
+            result.append(f"<b>{_inline_md_to_html(heading.group(2))}</b>")
+            continue
+        if re.match(r"^[-*_]{3,}\s*$", line):
+            result.append("─" * 16)
+            continue
+        list_item = re.match(r"^(\s*[-*+]|\s*\d+\.)\s+(.*)", line)
+        if list_item:
+            result.append(f"• {_inline_md_to_html(list_item.group(2))}")
+            continue
+        result.append(_inline_md_to_html(line))
+    if in_code and code_lines:
+        result.append(f"<pre><code>{html.escape(chr(10).join(code_lines))}</code></pre>")
+    return "\n".join(result)
+
 SUMMARY_START_MARKERS = [
     "готово",
     "ось що",
@@ -575,9 +687,9 @@ def split_message(text: str, max_len: int = TELEGRAM_MESSAGE_MAX_LEN) -> list[st
     return chunks or [""]
 
 
-def send_text_blocks(chat_id: int, text: str) -> None:
+def send_text_blocks(chat_id: int, text: str, parse_mode: str | None = None) -> None:
     for chunk in split_message(text):
-        send_message(chat_id, chunk)
+        send_message(chat_id, chunk, parse_mode=parse_mode)
 
 
 def send_group_done_ack(chat_id: int, message: dict) -> None:
@@ -1928,7 +2040,7 @@ def _parse_claude_stream_event(
             if block.get("type") == "text":
                 text = block.get("text", "")
                 if text:
-                    buffer.append(text)
+                    buffer.append(markdown_to_telegram_html(text))
                     text_buffer.append(text)
                     if not text.endswith("\n"):
                         buffer.append("\n")
@@ -1936,14 +2048,7 @@ def _parse_claude_stream_event(
             elif block.get("type") == "tool_use":
                 name = block.get("name", "")
                 inp = block.get("input", {})
-                if name == "Bash":
-                    cmd = inp.get("command", "").strip().splitlines()
-                    summary = cmd[0] if cmd else json.dumps(inp)
-                    if len(cmd) > 1:
-                        summary += f" … ({len(cmd) - 1} more lines)"
-                    buffer.append(f"[{name}: {summary}]\n")
-                else:
-                    buffer.append(f"[{name}: {json.dumps(inp, ensure_ascii=False)}]\n")
+                buffer.append(_format_tool_use_html(name, inp) + "\n")
                 # tool annotations go to verbose buffer only, not text_buffer
     elif event_type == "result":
         permission_denials.extend(event.get("permission_denials") or [])
@@ -2114,13 +2219,14 @@ def default_reply_prompt() -> str:
 def handle_debug_command(message: dict, state: dict) -> None:
     chat_id = message["chat"]["id"]
     user_id = message["from"]["id"]
+    claude_mode = AI_PROVIDER == "claude"
     active_request = enable_debug_for_active_request(user_id)
     if active_request and active_request.get("chat_id") == chat_id:
         raw_blocks = active_request.get("raw_blocks") or []
         if raw_blocks:
             send_message(chat_id, "Debug mode enabled for the current request. Sending the technical trace collected so far.")
             for block in raw_blocks:
-                send_text_blocks(chat_id, block)
+                send_text_blocks(chat_id, block, parse_mode="HTML" if claude_mode else None)
         else:
             send_message(chat_id, "Debug mode enabled for the current request. Technical details will appear as they are produced.")
         return
@@ -2128,7 +2234,7 @@ def handle_debug_command(message: dict, state: dict) -> None:
     latest_trace = get_latest_debug_trace(state, user_id)
     if latest_trace:
         send_message(chat_id, "Latest technical trace:")
-        send_text_blocks(chat_id, latest_trace)
+        send_text_blocks(chat_id, latest_trace, parse_mode="HTML" if claude_mode else None)
         return
 
     send_message(chat_id, "No active or recent request is available for debug.")
@@ -2210,7 +2316,7 @@ def process_copilot_request(
     def on_block(block: str) -> None:
         debug_enabled, debug_chat_id = append_active_request_block(user_id, block)
         if debug_enabled and debug_chat_id is not None:
-            send_text_blocks(debug_chat_id, block)
+            send_text_blocks(debug_chat_id, block, parse_mode="HTML" if AI_PROVIDER == "claude" else None)
 
     success, sent_any, result, permission_denials, text_content = stream_copilot(
         prompt, continue_session, on_block, extra_allowed_tools
@@ -2232,7 +2338,10 @@ def process_copilot_request(
         else:
             summary_text = build_user_facing_text(text_content)
             if summary_text:
-                send_text_blocks(chat_id, summary_text)
+                if AI_PROVIDER == "claude":
+                    send_text_blocks(chat_id, markdown_to_telegram_html(summary_text), parse_mode="HTML")
+                else:
+                    send_text_blocks(chat_id, summary_text)
             elif not sent_any:
                 send_message(chat_id, "Task finished.")
 
