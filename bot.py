@@ -49,6 +49,7 @@ TELEGRAM_TIMEOUT = int(os.environ.get("TELEGRAM_TIMEOUT", "30"))
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@").lower()
 DEFAULT_VERBOSE = os.environ.get("DEFAULT_VERBOSE", "false").strip().lower() in {"1", "true", "yes", "on"}
+CLAUDE_SKIP_PERMISSIONS = os.environ.get("CLAUDE_SKIP_PERMISSIONS", "false").strip().lower() in {"1", "true", "yes", "on"}
 TELEGRAM_MESSAGE_MAX_LEN = 3900
 STREAM_FLUSH_MAX_LEN = 3600
 STREAM_FLUSH_INTERVAL = 4.0
@@ -290,6 +291,8 @@ REQUESTS_LOCK = threading.RLock()
 MEDIA_GROUPS_LOCK = threading.RLock()
 ACTIVE_REQUESTS: dict[int, dict] = {}
 PENDING_MEDIA_GROUPS: dict[str, dict] = {}
+PENDING_PERMISSIONS_LOCK = threading.RLock()
+PENDING_PERMISSIONS: dict[int, dict] = {}
 
 
 def default_state() -> dict:
@@ -438,6 +441,32 @@ def send_message(
 
 def send_typing(chat_id: int) -> None:
     telegram_request("sendChatAction", {"chat_id": str(chat_id), "action": "typing"})
+
+
+def send_message_with_keyboard(
+    chat_id: int,
+    text: str,
+    keyboard: list[list[dict]],
+    reply_to_message_id: int | None = None,
+) -> None:
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "reply_markup": json.dumps({"inline_keyboard": keyboard}),
+    }
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = str(reply_to_message_id)
+    telegram_request("sendMessage", payload)
+
+
+def answer_callback_query(callback_query_id: str, text: str | None = None) -> None:
+    payload: dict = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        telegram_request("answerCallbackQuery", payload)
+    except Exception:
+        pass
 
 
 def get_message_text(message: dict) -> str:
@@ -851,6 +880,21 @@ def enable_debug_for_active_request(user_id: int) -> dict | None:
 def finish_active_request(user_id: int) -> dict | None:
     with REQUESTS_LOCK:
         return ACTIVE_REQUESTS.pop(user_id, None)
+
+
+def set_pending_permission(user_id: int, data: dict) -> None:
+    with PENDING_PERMISSIONS_LOCK:
+        PENDING_PERMISSIONS[user_id] = data
+
+
+def pop_pending_permission(user_id: int) -> dict | None:
+    with PENDING_PERMISSIONS_LOCK:
+        return PENDING_PERMISSIONS.pop(user_id, None)
+
+
+def clear_pending_permission(user_id: int) -> None:
+    with PENDING_PERMISSIONS_LOCK:
+        PENDING_PERMISSIONS.pop(user_id, None)
 
 
 def strip_ansi_sequences(text: str) -> str:
@@ -1802,20 +1846,81 @@ def handle_pending_upload(message: dict, state: dict, upload_session: dict) -> b
     return True
 
 
-def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool, bool, str]:
+def _parse_claude_stream_event(
+    line: str,
+    buffer: list[str],
+    permission_denials: list[dict],
+) -> bool:
+    """Parse one JSONL event from Claude's stream-json output.
+
+    Appends human-readable text to buffer and collects permission denials.
+    Returns True if the line was a recognised JSON event, False for raw text.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return True
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        buffer.append(line)
+        return False
+
+    event_type = event.get("type")
+    if event_type == "assistant":
+        for block in event.get("message", {}).get("content", []):
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                if text:
+                    buffer.append(text)
+                    if not text.endswith("\n"):
+                        buffer.append("\n")
+            elif block.get("type") == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                # Compact single-line representation for tool calls
+                if name == "Bash":
+                    cmd = inp.get("command", "").strip().splitlines()
+                    summary = cmd[0] if cmd else json.dumps(inp)
+                    if len(cmd) > 1:
+                        summary += f" … ({len(cmd) - 1} more lines)"
+                    buffer.append(f"[{name}: {summary}]\n")
+                else:
+                    buffer.append(f"[{name}: {json.dumps(inp, ensure_ascii=False)}]\n")
+    elif event_type == "result":
+        permission_denials.extend(event.get("permission_denials") or [])
+    return True
+
+
+def stream_copilot(
+    prompt: str,
+    continue_session: bool,
+    on_block,
+    extra_allowed_tools: list[str] | None = None,
+) -> tuple[bool, bool, str, list[dict]]:
+    """Run Claude/Copilot and stream output via on_block.
+
+    Returns (success, sent_any, error_message, permission_denials).
+    permission_denials is non-empty only when AI_PROVIDER=="claude" and Claude
+    refused one or more tool calls due to missing permissions.
+    """
     command = [provider_bin()]
     if AI_PROVIDER == "claude":
         if continue_session:
             command.append("--continue")
-        command.extend([
+        args = [
             "--print",
             prompt,
             "--output-format",
-            "text",
-            "--dangerously-skip-permissions",
+            "stream-json",
             "--add-dir",
             str(UPLOAD_DIR),
-        ])
+        ]
+        if extra_allowed_tools:
+            for tool in extra_allowed_tools:
+                args.extend(["--allowedTools", tool])
+        elif CLAUDE_SKIP_PERMISSIONS and os.getuid() != 0:
+            args.append("--dangerously-skip-permissions")
+        command.extend(args)
     else:
         if continue_session:
             command.append("--continue")
@@ -1840,14 +1945,15 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
     user_id = getattr(worker, "user_id", None)
     if user_id is None:
         terminate_process(process)
-        return False, False, "Worker metadata is missing for this request."
+        return False, False, "Worker metadata is missing for this request.", []
     if not bind_active_request_process(user_id, process):
         terminate_process(process)
-        return False, False, "Request state was lost before Copilot started."
+        return False, False, "Request state was lost before Copilot started.", []
     deadline = time.monotonic() + COPILOT_TIMEOUT
     buffer: list[str] = []
     sent_any = False
     last_flush = time.monotonic()
+    permission_denials: list[dict] = []
     assert process.stdout is not None
 
     def flush_buffer() -> None:
@@ -1867,11 +1973,11 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
             if active_request is None or active_request.get("cancel_requested"):
                 terminate_process(process)
                 flush_buffer()
-                return False, sent_any, "Request was cancelled."
+                return False, sent_any, "Request was cancelled.", []
             if time.monotonic() > deadline:
                 terminate_process(process)
                 flush_buffer()
-                return False, sent_any, f"Timed out after {COPILOT_TIMEOUT} seconds."
+                return False, sent_any, f"Timed out after {COPILOT_TIMEOUT} seconds.", []
 
             line = process.stdout.readline()
             if line == "" and process.poll() is not None:
@@ -1880,7 +1986,11 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
                 time.sleep(0.1)
                 continue
 
-            buffer.append(line)
+            if AI_PROVIDER == "claude":
+                _parse_claude_stream_event(line, buffer, permission_denials)
+            else:
+                buffer.append(line)
+
             current = "".join(buffer)
             if line.strip() == "" and len(current.strip()) >= STREAM_FLUSH_MIN_PARAGRAPH_LEN:
                 flush_buffer()
@@ -1895,17 +2005,17 @@ def stream_copilot(prompt: str, continue_session: bool, on_block) -> tuple[bool,
     except Exception as error:
         terminate_process(process)
         flush_buffer()
-        return False, sent_any, str(error)
+        return False, sent_any, str(error), []
 
     flush_buffer()
     active_request = get_active_request(user_id)
     if active_request is None or active_request.get("cancel_requested"):
-        return False, sent_any, "Request was cancelled."
+        return False, sent_any, "Request was cancelled.", []
     if process.returncode == 0:
-        return True, sent_any, ""
+        return True, sent_any, "", permission_denials
     if process.returncode in {-signal.SIGTERM, -signal.SIGKILL}:
-        return False, sent_any, "Request was cancelled."
-    return False, sent_any, f"Exit code {process.returncode}"
+        return False, sent_any, "Request was cancelled.", []
+    return False, sent_any, f"Exit code {process.returncode}", []
 
 
 def extract_prompt(text: str) -> tuple[str | None, bool]:
@@ -1960,7 +2070,24 @@ def handle_debug_command(message: dict, state: dict) -> None:
     send_message(chat_id, "No active or recent request is available for debug.")
 
 
-def process_copilot_request(state: dict, message: dict, prompt: str, continue_session: bool, user_id: int, chat_id: int) -> None:
+def _build_permission_keyboard(user_id: int, denied_tools: list[dict]) -> list[list[dict]]:
+    names = sorted({d.get("tool_name", "") for d in denied_tools if d.get("tool_name")})
+    label = f"Allow {', '.join(names)} & retry" if names else "Allow all & retry"
+    return [
+        [{"text": f"✅ {label}", "callback_data": f"perm_allow:{user_id}"}],
+        [{"text": "❌ Skip (keep partial result)", "callback_data": f"perm_deny:{user_id}"}],
+    ]
+
+
+def process_copilot_request(
+    state: dict,
+    message: dict,
+    prompt: str,
+    continue_session: bool,
+    user_id: int,
+    chat_id: int,
+    extra_allowed_tools: list[str] | None = None,
+) -> None:
     request = start_active_request(user_id, chat_id, message, get_user_verbose_mode(state, user_id))
     send_typing(chat_id)
     send_message(chat_id, "Working...")
@@ -1972,7 +2099,9 @@ def process_copilot_request(state: dict, message: dict, prompt: str, continue_se
         if debug_enabled and debug_chat_id is not None:
             send_text_blocks(debug_chat_id, block)
 
-    success, sent_any, result = stream_copilot(prompt, continue_session, on_block)
+    success, sent_any, result, permission_denials = stream_copilot(
+        prompt, continue_session, on_block, extra_allowed_tools
+    )
     completed_request = finish_active_request(user_id) or request
     raw_text = "\n\n".join(completed_request.get("raw_blocks") or [])
     if raw_text:
@@ -1987,7 +2116,28 @@ def process_copilot_request(state: dict, message: dict, prompt: str, continue_se
             send_text_blocks(chat_id, summary_text)
         elif not sent_any:
             send_message(chat_id, "Task finished.")
-        send_group_done_ack(chat_id, message)
+
+        if permission_denials:
+            # Task succeeded but some tools were blocked — offer retry with those tools allowed.
+            tool_names = sorted({d.get("tool_name", "") for d in permission_denials if d.get("tool_name")})
+            denied_summary = ", ".join(f"`{n}`" for n in tool_names) if tool_names else "some tools"
+            set_pending_permission(user_id, {
+                "prompt": prompt,
+                "continue_session": continue_session,
+                "chat_id": chat_id,
+                "message": message,
+                "denied_tools": permission_denials,
+                "allowed_tools": [f"{n}(*)" for n in tool_names] if tool_names else [],
+            })
+            keyboard = _build_permission_keyboard(user_id, permission_denials)
+            send_message_with_keyboard(
+                chat_id,
+                f"Claude was blocked from using {denied_summary}. "
+                "Allow those tools and retry the same request?",
+                keyboard,
+            )
+        else:
+            send_group_done_ack(chat_id, message)
         return
 
     session_state = get_session_state(state, user_id)
@@ -2004,6 +2154,48 @@ def process_copilot_request(state: dict, message: dict, prompt: str, continue_se
         if completed_request.get("debug_enabled"):
             send_text_blocks(chat_id, result)
     send_group_done_ack(chat_id, message)
+
+
+def handle_callback_query(query: dict, state: dict) -> None:
+    query_id = query.get("id", "")
+    user_id = int((query.get("from") or {}).get("id", 0))
+    chat_id = int(((query.get("message") or {}).get("chat") or {}).get("id", 0))
+    data = query.get("data", "")
+
+    answer_callback_query(query_id)
+
+    if not user_id or not chat_id:
+        return
+    if user_id not in ALLOWED_USER_IDS:
+        return
+
+    if data == f"perm_allow:{user_id}":
+        pending = pop_pending_permission(user_id)
+        if not pending:
+            send_message(chat_id, "This permission request has already been handled or has expired.")
+            return
+        if get_active_request(user_id):
+            send_message(chat_id, busy_lock_text())
+            return
+        allowed_tools = pending.get("allowed_tools") or []
+        worker = threading.Thread(
+            target=process_copilot_request,
+            args=(
+                state,
+                pending["message"],
+                pending["prompt"],
+                pending["continue_session"],
+                user_id,
+                chat_id,
+                allowed_tools or None,
+            ),
+            daemon=True,
+        )
+        worker.start()
+
+    elif data == f"perm_deny:{user_id}":
+        pop_pending_permission(user_id)
+        send_message(chat_id, "Skipped. The previous response stands as-is.")
 
 
 def handle_message(message: dict, state: dict) -> None:
@@ -2124,6 +2316,7 @@ def handle_message(message: dict, state: dict) -> None:
             send_message(chat_id, busy_lock_text())
             return
         session_state["has_session"] = False
+        clear_pending_permission(user_id)
         save_state(state)
         send_message(chat_id, f"Started a fresh {provider_name()} thread for your account.")
         send_group_done_ack(chat_id, message)
@@ -2354,7 +2547,10 @@ def main() -> int:
                 state["offset"] = update["update_id"] + 1
                 save_state(state)
                 message = update.get("message")
-                if message and ("text" in message or "caption" in message or extract_attachment(message)):
+                callback_query = update.get("callback_query")
+                if callback_query:
+                    handle_callback_query(callback_query, state)
+                elif message and ("text" in message or "caption" in message or extract_attachment(message)):
                     if message.get("media_group_id"):
                         queue_media_group_message(message)
                         continue
