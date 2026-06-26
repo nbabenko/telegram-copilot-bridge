@@ -13,6 +13,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Strip ANSI/VT100 escape sequences from terminal output.
+_ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub("", text)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "state.json"
@@ -304,6 +311,7 @@ QUEUED_MESSAGES_LOCK = threading.RLock()
 QUEUED_MESSAGES: dict[int, list[dict]] = {}  # user_id -> queued Telegram message dicts
 USER_CLI_MODE: dict[int, bool] = {}  # user_id -> True when in shell mode
 USER_CLI_CWD: dict[int, str] = {}  # user_id -> current working directory for shell mode
+ACTIVE_SHELL_PROCESS: dict[int, subprocess.Popen] = {}  # user_id -> running shell subprocess
 
 
 def default_state() -> dict:
@@ -632,13 +640,21 @@ def edit_message_reply_markup(chat_id: int, message_id: int, keyboard: list[list
             print(f"bridge warning: editMessageReplyMarkup failed: {error} {body}".strip(), file=sys.stderr, flush=True)
 
 
-def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
+def edit_message_text(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    parse_mode: str | None = None,
+    keyboard: list[list[dict]] | None = None,
+) -> None:
     payload = {
         "chat_id": str(chat_id),
         "message_id": str(message_id),
         "text": text,
-        "reply_markup": json.dumps({"inline_keyboard": []}),
+        "reply_markup": json.dumps({"inline_keyboard": keyboard if keyboard is not None else []}),
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
         telegram_request("editMessageText", payload)
     except Exception as error:
@@ -648,7 +664,8 @@ def edit_message_text(chat_id: int, message_id: int, text: str) -> None:
                 body = error.read().decode("utf-8", errors="replace")  # type: ignore[union-attr]
             except Exception:
                 pass
-        print(f"bridge warning: editMessageText failed: {error} {body}".strip(), file=sys.stderr, flush=True)
+        if "not modified" not in body:
+            print(f"bridge warning: editMessageText failed: {error} {body}".strip(), file=sys.stderr, flush=True)
 
 
 def get_message_text(message: dict) -> str:
@@ -1081,7 +1098,7 @@ def clear_pending_permission(user_id: int) -> None:
 
 
 def strip_ansi_sequences(text: str) -> str:
-    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
+    return strip_ansi(text)
 
 
 def is_technical_line(line: str) -> bool:
@@ -1707,10 +1724,14 @@ def status_text(state: dict, user_id: int) -> str:
     chat_count = len(subscriptions)
     mode = "shell" if get_user_cli_mode(user_id) else "agent"
     queued = len(QUEUED_MESSAGES.get(user_id, []))
+    shell_proc = ACTIVE_SHELL_PROCESS.get(user_id)
+    shell_running = shell_proc is not None and shell_proc.poll() is None
     return (
         "Bridge is running\n\n"
         f"Provider: {provider_name()} ({provider_bin()})\n"
         f"Mode: {mode}\n"
+        f"Shell cwd: {get_cli_cwd(user_id)}\n"
+        f"Shell process: {'running' if shell_running else 'idle'}\n"
         f"Repo: {REPO_PATH}\n"
         f"Branch: {branch}\n"
         f"GitHub Actions: {'enabled' if GITHUB_ACTIONS_ENABLED else 'disabled'}\n"
@@ -1719,7 +1740,7 @@ def status_text(state: dict, user_id: int) -> str:
         f"Object storage upload: {'enabled' if OBJECT_STORAGE_ENABLED else 'disabled'}\n"
         f"Whitelisted users: {len(ALLOWED_USER_IDS)}\n"
         f"Session state: {'continuing' if session_state.get('has_session') else 'new'}\n"
-        f"Active request: {'yes' if get_active_request(user_id) else 'no'}\n"
+        f"Active agent request: {'yes' if get_active_request(user_id) else 'no'}\n"
         f"Queued messages: {queued}\n"
         f"Upload tool: {'configured' if UPLOAD_TOOL.exists() else 'missing'}"
     )
@@ -2407,12 +2428,51 @@ def _build_permission_keyboard(user_id: int, denied_tools: list[dict]) -> list[l
     return buttons
 
 
-def run_shell_command(chat_id: int, user_id: int, cmd_text: str) -> None:
-    """Execute a raw shell command and send the result to Telegram."""
-    cwd = get_cli_cwd(user_id)
+_SHELL_MAX_OUTPUT_CHARS = 3200  # Telegram message limit is 4096, leave room for framing
 
-    # Handle `cd` specially — subprocess can't change the bot's working dir.
+
+def _format_shell_message(
+    header: str,
+    output: str,
+    cwd: str,
+    running: bool = True,
+    exit_code: int | None = None,
+    keyboard: list[list[dict]] | None = None,
+) -> tuple[str, list[list[dict]]]:
+    """Build the HTML body and keyboard for a shell output message."""
+    # Strip ANSI, keep only last N chars of output (tail matters most).
+    clean = strip_ansi(output).rstrip()
+    truncated = False
+    if len(clean) > _SHELL_MAX_OUTPUT_CHARS:
+        clean = clean[-_SHELL_MAX_OUTPUT_CHARS:]
+        newline_pos = clean.find("\n")
+        if newline_pos > 0:
+            clean = "…\n" + clean[newline_pos + 1:]
+        truncated = True
+
+    parts: list[str] = [f"<code>$ {html.escape(header)}</code>"]
+    if truncated:
+        parts.append("<i>(output truncated — showing tail)</i>")
+    if clean:
+        parts.append(f"<pre>{html.escape(clean)}</pre>")
+
+    if running:
+        parts.append("⏳")
+        kbd = []
+    else:
+        icon = "✅" if (exit_code or 0) == 0 else "❌"
+        parts.append(f"{icon} exit {exit_code}  <code>{html.escape(cwd)}</code>")
+        kbd = keyboard or []
+
+    return "\n\n".join(parts), kbd
+
+
+def run_shell_command(chat_id: int, user_id: int, cmd_text: str) -> None:
+    """Execute a shell command, streaming output by editing a single Telegram message."""
+    cwd = get_cli_cwd(user_id)
     stripped_cmd = cmd_text.strip()
+
+    # ---- Special-case `cd` — subprocess can't change the bot's working dir ----
     if re.match(r"^cd(\s|$)", stripped_cmd):
         target = stripped_cmd[2:].strip() or str(Path.home())
         target = os.path.expanduser(target)
@@ -2421,45 +2481,76 @@ def run_shell_command(chat_id: int, user_id: int, cmd_text: str) -> None:
             set_cli_cwd(user_id, new_path)
             send_message_with_keyboard(
                 chat_id,
-                f"<code>$ {html.escape(stripped_cmd)}</code>\n📂 {html.escape(new_path)}",
+                f"<code>$ {html.escape(stripped_cmd)}</code>\n📂 <code>{html.escape(new_path)}</code>",
                 _build_switch_to_agent_keyboard(user_id),
                 parse_mode="HTML",
             )
         else:
-            send_message(chat_id, f"cd: {html.escape(target)}: No such directory", parse_mode="HTML")
+            send_message(chat_id, f"bash: cd: {html.escape(target)}: No such directory", parse_mode="HTML")
         return
 
     send_typing(chat_id)
+
+    # Wrapper: print cwd as last line so we can track directory changes.
+    cwd_sentinel = "__CWD__:"
+    wrapper = f"{stripped_cmd}\necho '{cwd_sentinel}'\"$(pwd)\""
+
     try:
-        result = subprocess.run(
-            ["bash", "-c", stripped_cmd],
+        process = subprocess.Popen(
+            ["bash", "-c", wrapper],
             cwd=cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE,  # open so we can forward user input
             text=True,
-            timeout=60,
+            bufsize=1,
         )
-        stdout = (result.stdout or "").rstrip()
-        stderr = (result.stderr or "").rstrip()
-        output = stdout + ("\n" + stderr if stderr else "")
-        exit_icon = "✅" if result.returncode == 0 else "❌"
-        header = f"<code>$ {html.escape(stripped_cmd)}</code>"
-        footer = f"{exit_icon} exit {result.returncode}  <code>{html.escape(cwd)}</code>"
-        if output:
-            if len(output) > 3500:
-                output = output[:3497] + "…"
-            body = f"{header}\n\n<pre>{html.escape(output)}</pre>\n\n{footer}"
-        else:
-            body = f"{header}\n\n{footer}"
-        send_message_with_keyboard(
-            chat_id,
-            body,
-            _build_switch_to_agent_keyboard(user_id),
-            parse_mode="HTML",
-        )
-    except subprocess.TimeoutExpired:
-        send_message(chat_id, "❌ Command timed out (60 s)")
     except Exception as error:
-        send_message(chat_id, f"❌ Error: {html.escape(str(error))}", parse_mode="HTML")
+        send_message(chat_id, f"❌ <code>{html.escape(str(error))}</code>", parse_mode="HTML")
+        return
+
+    ACTIVE_SHELL_PROCESS[user_id] = process
+
+    # Send the "live" message placeholder.
+    init_body, _ = _format_shell_message(stripped_cmd, "", cwd, running=True)
+    msg_id = send_message(chat_id, init_body, parse_mode="HTML")
+
+    output_buf: list[str] = []
+    last_edit = time.monotonic()
+
+    try:
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            # Detect the cwd sentinel — don't add to visible output.
+            if raw_line.startswith(cwd_sentinel):
+                new_cwd = raw_line[len(cwd_sentinel):].strip()
+                if new_cwd and os.path.isdir(new_cwd):
+                    set_cli_cwd(user_id, new_cwd)
+                continue
+            output_buf.append(raw_line)
+            # Edit the message at most once every 2 s to stay within Telegram rate limits.
+            if msg_id and time.monotonic() - last_edit >= 2:
+                body, _ = _format_shell_message(stripped_cmd, "".join(output_buf), cwd, running=True)
+                edit_message_text(chat_id, msg_id, body, parse_mode="HTML")
+                last_edit = time.monotonic()
+        process.wait(timeout=5)
+    except Exception:
+        pass
+    finally:
+        ACTIVE_SHELL_PROCESS.pop(user_id, None)
+
+    exit_code = process.returncode if process.returncode is not None else -1
+    final_cwd = get_cli_cwd(user_id)
+    agent_kb = _build_switch_to_agent_keyboard(user_id)
+
+    final_body, final_kbd = _format_shell_message(
+        stripped_cmd, "".join(output_buf), final_cwd,
+        running=False, exit_code=exit_code, keyboard=agent_kb,
+    )
+    if msg_id:
+        edit_message_text(chat_id, msg_id, final_body, parse_mode="HTML", keyboard=final_kbd)
+    else:
+        send_message_with_keyboard(chat_id, final_body, agent_kb, parse_mode="HTML")
 
 
 def process_copilot_request(
@@ -2720,6 +2811,13 @@ def handle_message(message: dict, state: dict) -> None:
         return
     if command == "/cancel":
         cleared = clear_queued_messages(user_id)
+        # Kill running shell process if any.
+        shell_proc = ACTIVE_SHELL_PROCESS.pop(user_id, None)
+        if shell_proc is not None and shell_proc.poll() is None:
+            shell_proc.terminate()
+            extra = f" ({cleared} queued also cleared)" if cleared else ""
+            send_message(chat_id, f"⛔ Shell process killed.{extra}")
+            return
         active_request = get_active_request(user_id)
         if active_request:
             cancel_active_request(user_id)
@@ -2764,11 +2862,21 @@ def handle_message(message: dict, state: dict) -> None:
         send_group_done_ack(chat_id, message)
         return
 
-    # ---- Shell (CLI) mode: forward text as raw bash commands ----
-    if get_user_cli_mode(user_id) and text and not command:
-        if get_active_request(user_id):
-            send_message(chat_id, "⏳ Still running — wait or /cancel")
+    # ---- Shell (CLI) mode: forward text as raw bash commands or stdin ----
+    if get_user_cli_mode(user_id) and not command:
+        if not text:
             return
+        # If a process is actively running, forward message as stdin.
+        shell_proc = ACTIVE_SHELL_PROCESS.get(user_id)
+        if shell_proc is not None and shell_proc.poll() is None:
+            try:
+                assert shell_proc.stdin is not None
+                shell_proc.stdin.write(text + "\n")
+                shell_proc.stdin.flush()
+            except Exception:
+                pass
+            return
+        # No running process — start a new command.
         threading.Thread(
             target=run_shell_command, args=(chat_id, user_id, text), daemon=True
         ).start()
