@@ -2410,6 +2410,14 @@ def _build_switch_to_shell_keyboard(user_id: int) -> list[list[dict]]:
     return [[{"text": "💻 Switch to Shell", "callback_data": f"to_shell:{user_id}"}]]
 
 
+def _build_shell_running_keyboard(user_id: int) -> list[list[dict]]:
+    """Keyboard shown while a shell process is running."""
+    return [[
+        {"text": "⛔ Ctrl+C", "callback_data": f"shell_sigint:{user_id}"},
+        {"text": "⌨️ Ctrl+D", "callback_data": f"shell_eof:{user_id}"},
+    ]]
+
+
 def _build_permission_keyboard(user_id: int, denied_tools: list[dict]) -> list[list[dict]]:
     buttons: list[list[dict]] = []
     seen: set[str] = set()
@@ -2435,6 +2443,7 @@ def _format_shell_message(
     header: str,
     output: str,
     cwd: str,
+    user_id: int,
     running: bool = True,
     exit_code: int | None = None,
     keyboard: list[list[dict]] | None = None,
@@ -2452,13 +2461,13 @@ def _format_shell_message(
 
     parts: list[str] = [f"<code>$ {html.escape(header)}</code>"]
     if truncated:
-        parts.append("<i>(output truncated — showing tail)</i>")
+        parts.append("<i>(showing tail)</i>")
     if clean:
         parts.append(f"<pre>{html.escape(clean)}</pre>")
 
     if running:
-        parts.append("⏳")
-        kbd = []
+        parts.append("⏳ running")
+        kbd = _build_shell_running_keyboard(user_id)
     else:
         icon = "✅" if (exit_code or 0) == 0 else "❌"
         parts.append(f"{icon} exit {exit_code}  <code>{html.escape(cwd)}</code>")
@@ -2504,6 +2513,7 @@ def run_shell_command(chat_id: int, user_id: int, cmd_text: str) -> None:
             stdin=subprocess.PIPE,  # open so we can forward user input
             text=True,
             bufsize=1,
+            preexec_fn=os.setsid,  # new process group — SIGINT reaches all children
         )
     except Exception as error:
         send_message(chat_id, f"❌ <code>{html.escape(str(error))}</code>", parse_mode="HTML")
@@ -2511,9 +2521,9 @@ def run_shell_command(chat_id: int, user_id: int, cmd_text: str) -> None:
 
     ACTIVE_SHELL_PROCESS[user_id] = process
 
-    # Send the "live" message placeholder.
-    init_body, _ = _format_shell_message(stripped_cmd, "", cwd, running=True)
-    msg_id = send_message(chat_id, init_body, parse_mode="HTML")
+    # Send the "live" message with Ctrl+C / Ctrl+D buttons.
+    init_body, init_kbd = _format_shell_message(stripped_cmd, "", cwd, user_id, running=True)
+    msg_id = send_message_with_keyboard(chat_id, init_body, init_kbd, parse_mode="HTML")
 
     output_buf: list[str] = []
     last_edit = time.monotonic()
@@ -2528,10 +2538,12 @@ def run_shell_command(chat_id: int, user_id: int, cmd_text: str) -> None:
                     set_cli_cwd(user_id, new_cwd)
                 continue
             output_buf.append(raw_line)
-            # Edit the message at most once every 2 s to stay within Telegram rate limits.
+            # Edit at most once every 2 s (Telegram rate limit).
             if msg_id and time.monotonic() - last_edit >= 2:
-                body, _ = _format_shell_message(stripped_cmd, "".join(output_buf), cwd, running=True)
-                edit_message_text(chat_id, msg_id, body, parse_mode="HTML")
+                body, kbd = _format_shell_message(
+                    stripped_cmd, "".join(output_buf), cwd, user_id, running=True
+                )
+                edit_message_text(chat_id, msg_id, body, parse_mode="HTML", keyboard=kbd)
                 last_edit = time.monotonic()
         process.wait(timeout=5)
     except Exception:
@@ -2544,7 +2556,7 @@ def run_shell_command(chat_id: int, user_id: int, cmd_text: str) -> None:
     agent_kb = _build_switch_to_agent_keyboard(user_id)
 
     final_body, final_kbd = _format_shell_message(
-        stripped_cmd, "".join(output_buf), final_cwd,
+        stripped_cmd, "".join(output_buf), final_cwd, user_id,
         running=False, exit_code=exit_code, keyboard=agent_kb,
     )
     if msg_id:
@@ -2722,6 +2734,35 @@ def handle_callback_query(query: dict, state: dict) -> None:
         cwd = get_cli_cwd(user_id)
         send_message(chat_id, f"💻 Switched to Shell mode.\n<code>{html.escape(cwd)}</code>", parse_mode="HTML")
 
+    elif data == f"shell_sigint:{user_id}":
+        answer_callback_query(query_id, "Ctrl+C sent")
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id)
+        shell_proc = ACTIVE_SHELL_PROCESS.get(user_id)
+        if shell_proc is not None and shell_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(shell_proc.pid), signal.SIGINT)
+            except Exception:
+                try:
+                    shell_proc.send_signal(signal.SIGINT)
+                except Exception:
+                    pass
+        else:
+            send_message(chat_id, "No process running.")
+
+    elif data == f"shell_eof:{user_id}":
+        answer_callback_query(query_id, "Ctrl+D sent")
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id)
+        shell_proc = ACTIVE_SHELL_PROCESS.get(user_id)
+        if shell_proc is not None and shell_proc.poll() is None and shell_proc.stdin:
+            try:
+                shell_proc.stdin.close()
+            except Exception:
+                pass
+        else:
+            send_message(chat_id, "No process running.")
+
 
 def handle_message(message: dict, state: dict) -> None:
     chat_id = message["chat"]["id"]
@@ -2866,9 +2907,31 @@ def handle_message(message: dict, state: dict) -> None:
     if get_user_cli_mode(user_id) and not command:
         if not text:
             return
-        # If a process is actively running, forward message as stdin.
         shell_proc = ACTIVE_SHELL_PROCESS.get(user_id)
-        if shell_proc is not None and shell_proc.poll() is None:
+        proc_running = shell_proc is not None and shell_proc.poll() is None
+
+        # Detect Ctrl+C / Ctrl+D typed as text.
+        normalized = text.strip().lower().replace("-", "+")
+        if normalized in {"^c", "ctrl+c", "c"}:
+            if proc_running:
+                try:
+                    os.killpg(os.getpgid(shell_proc.pid), signal.SIGINT)
+                except Exception:
+                    try:
+                        shell_proc.send_signal(signal.SIGINT)
+                    except Exception:
+                        pass
+            return
+        if normalized in {"^d", "ctrl+d", "d", "exit", "quit"}:
+            if proc_running and shell_proc.stdin:
+                try:
+                    shell_proc.stdin.close()
+                except Exception:
+                    pass
+            return
+
+        # If a process is running, forward message as stdin.
+        if proc_running:
             try:
                 assert shell_proc.stdin is not None
                 shell_proc.stdin.write(text + "\n")
@@ -2876,6 +2939,7 @@ def handle_message(message: dict, state: dict) -> None:
             except Exception:
                 pass
             return
+
         # No running process — start a new command.
         threading.Thread(
             target=run_shell_command, args=(chat_id, user_id, text), daemon=True
