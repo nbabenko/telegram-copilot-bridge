@@ -103,12 +103,13 @@ OBJECT_STORAGE_ENABLED = not MISSING_OBJECT_STORAGE_ENV
 BASE_STATIC_BOT_COMMANDS = [
     {"command": "start", "description": "Show help and quick start"},
     {"command": "help", "description": "Show help and commands"},
-    {"command": "new", "description": "Start a fresh assistant thread"},
+    {"command": "new", "description": "Start a fresh Claude session"},
     {"command": "login", "description": "Log in to Claude (shows auth URL)"},
     {"command": "status", "description": "Show bridge and session status"},
+    {"command": "cancel", "description": "Cancel the running task or upload"},
+    {"command": "shell", "description": "Switch to shell (CLI) mode"},
+    {"command": "agent", "description": "Switch back to Claude agent mode"},
     {"command": "debug", "description": "Show or enable full technical trace"},
-    {"command": "verbose", "description": "Toggle default verbose mode for your requests"},
-    {"command": "cancel", "description": "Cancel a pending upload or active request"},
 ]
 
 CREDITS_LIMIT_PATTERNS = [
@@ -140,7 +141,7 @@ EXPLICIT_PROMPT_COMMANDS = {
 }
 CLAUDE_COMMANDS_DISCOVERY_CMD = os.environ.get(
     "CLAUDE_COMMANDS_DISCOVERY_CMD",
-    f"{CLAUDE_BIN} -p \"/help\" --output-format text",
+    f"{CLAUDE_BIN} -p \"List all available slash commands\" --output-format text",
 ).strip()
 CLAUDE_COMMANDS_DIRS = [
     Path(item).expanduser()
@@ -271,14 +272,9 @@ def build_bot_commands() -> tuple[list[dict], dict[str, str]]:
         commands.extend(GITHUB_ACTIONS_COMMANDS)
     if OBJECT_STORAGE_ENABLED:
         commands.extend(UPLOAD_COMMANDS)
-    provider_prompt_command = AI_PROVIDER
-    commands.append(
-        {
-            "command": provider_prompt_command,
-            "description": EXPLICIT_PROMPT_COMMANDS[provider_prompt_command],
-        }
-    )
 
+    # Build slash aliases for Claude slash commands — NOT added to the visible menu.
+    # The transparent architecture forwards any unknown slash command directly to Claude.
     slash_aliases: dict[str, str] = {}
     used_names = {item["command"] for item in commands}
     for command_name in discover_dynamic_provider_commands():
@@ -290,18 +286,13 @@ def build_bot_commands() -> tuple[list[dict], dict[str, str]]:
             alias = f"{base_name[: max(1, 32 - len(tail))]}{tail}"
             suffix += 1
         used_names.add(alias)
-        commands.append(
-            {
-                "command": alias,
-                "description": f"Run Claude /{command_name}"[:256],
-            }
-        )
         slash_aliases[f"/{alias}"] = f"/{command_name}"
 
     return commands, slash_aliases
 
 
 BOT_COMMANDS, PROVIDER_SLASH_ALIASES = build_bot_commands()
+BOT_COMMAND_NAMES: set[str] = {f"/{c['command']}" for c in BOT_COMMANDS}
 STATE_LOCK = threading.RLock()
 REQUESTS_LOCK = threading.RLock()
 MEDIA_GROUPS_LOCK = threading.RLock()
@@ -309,6 +300,10 @@ ACTIVE_REQUESTS: dict[int, dict] = {}
 PENDING_MEDIA_GROUPS: dict[str, dict] = {}
 PENDING_PERMISSIONS_LOCK = threading.RLock()
 PENDING_PERMISSIONS: dict[int, dict] = {}
+QUEUED_MESSAGES_LOCK = threading.RLock()
+QUEUED_MESSAGES: dict[int, list[dict]] = {}  # user_id -> queued Telegram message dicts
+USER_CLI_MODE: dict[int, bool] = {}  # user_id -> True when in shell mode
+USER_CLI_CWD: dict[int, str] = {}  # user_id -> current working directory for shell mode
 
 
 def default_state() -> dict:
@@ -558,13 +553,26 @@ def send_message(
     text: str,
     reply_to_message_id: int | None = None,
     parse_mode: str | None = None,
-) -> None:
+) -> int | None:
+    """Send a message and return its message_id, or None on error."""
     payload = {"chat_id": str(chat_id), "text": text}
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = str(reply_to_message_id)
     if parse_mode is not None:
         payload["parse_mode"] = parse_mode
-    telegram_request("sendMessage", payload)
+    try:
+        result = telegram_request("sendMessage", payload)
+        return (result.get("result") or {}).get("message_id")
+    except Exception as error:
+        print(f"bridge warning: sendMessage failed: {error}", file=sys.stderr, flush=True)
+        return None
+
+
+def delete_message(chat_id: int, message_id: int) -> None:
+    try:
+        telegram_request("deleteMessage", {"chat_id": str(chat_id), "message_id": str(message_id)})
+    except Exception:
+        pass
 
 
 def send_typing(chat_id: int) -> None:
@@ -576,7 +584,8 @@ def send_message_with_keyboard(
     text: str,
     keyboard: list[list[dict]],
     reply_to_message_id: int | None = None,
-) -> None:
+    parse_mode: str | None = None,
+) -> int | None:
     payload = {
         "chat_id": str(chat_id),
         "text": text,
@@ -584,7 +593,14 @@ def send_message_with_keyboard(
     }
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = str(reply_to_message_id)
-    telegram_request("sendMessage", payload)
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
+    try:
+        result = telegram_request("sendMessage", payload)
+        return (result.get("result") or {}).get("message_id")
+    except Exception as error:
+        print(f"bridge warning: sendMessage (keyboard) failed: {error}", file=sys.stderr, flush=True)
+        return None
 
 
 def answer_callback_query(callback_query_id: str, text: str | None = None) -> None:
@@ -978,15 +994,16 @@ def get_active_request(user_id: int) -> dict | None:
         return ACTIVE_REQUESTS.get(user_id)
 
 
-def start_active_request(user_id: int, chat_id: int, message: dict, verbose_enabled: bool = False) -> dict:
+def start_active_request(user_id: int, chat_id: int, message: dict) -> dict:
     request = {
         "chat_id": chat_id,
         "message": message,
         "raw_blocks": [],
-        "debug_enabled": bool(verbose_enabled),
+        "debug_enabled": True,  # always stream live
         "process": None,
         "cancel_requested": False,
         "started_at": int(time.time()),
+        "status_message_id": None,  # edited in-place as progress indicator
     }
     with REQUESTS_LOCK:
         ACTIVE_REQUESTS[user_id] = request
@@ -1499,46 +1516,98 @@ def get_user_settings(state: dict, user_id: int) -> dict:
     return raw
 
 
-def get_user_verbose_override(state: dict, user_id: int) -> bool | None:
-    settings = get_user_settings(state, user_id)
-    value = settings.get("verbose")
-    if isinstance(value, bool):
-        return value
-    return None
+def queue_user_message(user_id: int, message: dict) -> None:
+    with QUEUED_MESSAGES_LOCK:
+        QUEUED_MESSAGES.setdefault(user_id, []).append(message)
 
 
-def get_user_verbose_mode(state: dict, user_id: int) -> bool:
-    override = get_user_verbose_override(state, user_id)
-    if override is None:
-        return DEFAULT_VERBOSE
-    return override
+def pop_queued_message(user_id: int) -> dict | None:
+    with QUEUED_MESSAGES_LOCK:
+        queue = QUEUED_MESSAGES.get(user_id)
+        if queue:
+            return queue.pop(0)
+        return None
 
 
-def set_user_verbose_override(state: dict, user_id: int, value: bool | None) -> None:
-    settings = state.setdefault("user_settings", {})
-    key = str(user_id)
-    raw = settings.get(key)
-    if not isinstance(raw, dict):
-        raw = {}
-    if value is None:
-        raw.pop("verbose", None)
-    else:
-        raw["verbose"] = bool(value)
-    if raw:
-        settings[key] = raw
-    else:
-        settings.pop(key, None)
-    save_state(state)
+def clear_queued_messages(user_id: int) -> int:
+    with QUEUED_MESSAGES_LOCK:
+        queue = QUEUED_MESSAGES.pop(user_id, [])
+        return len(queue)
 
 
-def verbose_mode_status_text(state: dict, user_id: int) -> str:
-    override = get_user_verbose_override(state, user_id)
-    effective = get_user_verbose_mode(state, user_id)
-    source = "user override" if override is not None else "default"
-    return (
-        f"Verbose mode is {'ON' if effective else 'OFF'} ({source}).\n"
-        "Use /verbose on, /verbose off, /verbose toggle, or /verbose default."
-    )
+def get_user_cli_mode(user_id: int) -> bool:
+    return USER_CLI_MODE.get(user_id, False)
+
+
+def set_user_cli_mode(user_id: int, mode: bool) -> None:
+    USER_CLI_MODE[user_id] = mode
+
+
+def get_cli_cwd(user_id: int) -> str:
+    return USER_CLI_CWD.get(user_id, REPO_PATH)
+
+
+def set_cli_cwd(user_id: int, cwd: str) -> None:
+    USER_CLI_CWD[user_id] = cwd
+
+
+def _tool_status_label(name: str, inp: dict) -> str:
+    """Short human-readable status for a tool call (used in progress message)."""
+    icon = _tool_icon(name)
+    if name == "Bash":
+        cmd = (inp.get("command") or "").strip().splitlines()
+        short = cmd[0][:50] if cmd else name
+        return f"{icon} {short}"
+    if name in {"Read", "Write", "Edit", "MultiEdit"}:
+        path = str(inp.get("file_path") or inp.get("path") or "")
+        return f"{icon} {Path(path).name or path}"
+    if name in {"WebSearch", "ToolSearch"}:
+        return f"{icon} {str(inp.get('query', ''))[:50]}"
+    if name == "WebFetch":
+        return f"{icon} {str(inp.get('url', ''))[:50]}"
+    if name in {"Task", "Agent"}:
+        desc = str(inp.get("description") or inp.get("prompt") or "")[:50]
+        return f"{icon} {desc}"
+    return f"{icon} {name}"
+
+
+class _StatusUpdater:
+    """Edits a Telegram message in-place every 5 s to show elapsed time + current tool.
+
+    Emulates the CLI's in-place spinner line (● Orchestrating… 3m 12s).
+    """
+
+    def __init__(self, chat_id: int, message_id: int) -> None:
+        self._chat_id = chat_id
+        self._message_id = message_id
+        self._start = time.monotonic()
+        self._label = "Thinking"
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_label(self, label: str) -> None:
+        with self._lock:
+            self._label = label
+        self._edit()
+
+    def _edit(self) -> None:
+        elapsed = int(time.monotonic() - self._start)
+        with self._lock:
+            label = self._label
+        try:
+            edit_message_text(self._chat_id, self._message_id, f"⏳ {label}... {elapsed}s")
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        while not self._done.wait(timeout=5):
+            self._edit()
+
+    def stop(self) -> None:
+        self._done.set()
+        delete_message(self._chat_id, self._message_id)
 
 
 def get_latest_debug_trace(state: dict, user_id: int) -> str | None:
@@ -1586,9 +1655,8 @@ def access_denied_text(user_id: int) -> str:
 
 def busy_lock_text() -> str:
     return (
-        "I am still working on your previous request.\n\n"
-        "Use /cancel to stop it, /debug to inspect the live technical trace, "
-        "or wait for it to finish before starting a new task."
+        "Still working on the previous request.\n"
+        "Use /cancel to stop it, or wait — new messages are queued automatically."
     )
 
 
@@ -1598,26 +1666,26 @@ def help_text() -> str:
     )
     assistant_name = provider_name()
     actions_line = (
-        "GitHub Actions subscriptions are managed per chat: use /actions, then /watch <number>.\n\n"
+        "GitHub Actions: use /actions, then /watch <number>.\n\n"
         if GITHUB_ACTIONS_ENABLED
-        else "GitHub Actions integration is disabled until required env variables are set.\n\n"
+        else ""
     )
     upload_line = (
-        "Object storage upload is enabled: use /upload for media upload flow.\n\n"
+        "File uploads: use /upload.\n\n"
         if OBJECT_STORAGE_ENABLED
-        else "Object storage upload is disabled until required env variables are set.\n\n"
+        else ""
     )
     return (
-        f"Telegram {assistant_name} Bridge\n\n"
+        f"Remote CLI — {assistant_name} bridge\n\n"
         f"Repo: {REPO_PATH}\n\n"
         f"Commands:\n{command_lines}\n\n"
-        f"Any plain text message is sent to {assistant_name} in the configured repository.\n"
-        f"Telegram default output mode: {'verbose technical trace' if DEFAULT_VERBOSE else 'human-readable summary'}. "
-        "Use /debug if you want the full technical trace.\n\n"
+        "Any plain text message is sent as a prompt to the agent.\n"
+        "Unknown slash commands (e.g. /review, /agents) are forwarded to Claude.\n"
+        "Use /shell to drop into a raw shell and run commands directly.\n\n"
         f"{actions_line}"
         f"{upload_line}"
-        "In group chats, the bot responds only to allowed users who mention @"
-        f"{BOT_USERNAME}, use a command like /status@{BOT_USERNAME}, or reply directly to the bot."
+        "In group chats the bot responds only to allowed users who mention @"
+        f"{BOT_USERNAME} or use a command like /status@{BOT_USERNAME}."
     )
 
 
@@ -1637,11 +1705,12 @@ def status_text(state: dict, user_id: int) -> str:
     repo_slug = resolve_github_actions_repo() or "not configured"
     subscriptions = get_all_action_subscriptions(state)
     chat_count = len(subscriptions)
+    mode = "shell" if get_user_cli_mode(user_id) else "agent"
+    queued = len(QUEUED_MESSAGES.get(user_id, []))
     return (
         "Bridge is running\n\n"
         f"Provider: {provider_name()} ({provider_bin()})\n"
-        f"Default verbose mode: {'on' if DEFAULT_VERBOSE else 'off'}\n"
-        f"Your verbose mode: {'on' if get_user_verbose_mode(state, user_id) else 'off'}\n"
+        f"Mode: {mode}\n"
         f"Repo: {REPO_PATH}\n"
         f"Branch: {branch}\n"
         f"GitHub Actions: {'enabled' if GITHUB_ACTIONS_ENABLED else 'disabled'}\n"
@@ -1651,6 +1720,7 @@ def status_text(state: dict, user_id: int) -> str:
         f"Whitelisted users: {len(ALLOWED_USER_IDS)}\n"
         f"Session state: {'continuing' if session_state.get('has_session') else 'new'}\n"
         f"Active request: {'yes' if get_active_request(user_id) else 'no'}\n"
+        f"Queued messages: {queued}\n"
         f"Upload tool: {'configured' if UPLOAD_TOOL.exists() else 'missing'}"
     )
 
@@ -2017,11 +2087,13 @@ def _parse_claude_stream_event(
     buffer: list[str],
     text_buffer: list[str],
     permission_denials: list[dict],
+    tool_uses: dict[str, dict] | None = None,
+    on_tool_use=None,
 ) -> bool:
     """Parse one JSONL event from Claude's stream-json output.
 
-    buffer receives text + tool-call annotations (for verbose live streaming).
-    text_buffer receives text only (for clean non-verbose summary).
+    buffer receives HTML-formatted text + tool-call annotations (streamed live).
+    text_buffer receives plain text only.
     Returns True if the line was a recognised JSON event, False for raw text.
     """
     stripped = line.strip()
@@ -2048,8 +2120,13 @@ def _parse_claude_stream_event(
             elif block.get("type") == "tool_use":
                 name = block.get("name", "")
                 inp = block.get("input", {})
+                tool_id = block.get("id", "")
+                if tool_uses is not None and tool_id:
+                    tool_uses[tool_id] = {"input": inp}
+                if on_tool_use is not None:
+                    on_tool_use(name, inp)
                 buffer.append(_format_tool_use_html(name, inp) + "\n")
-                # tool annotations go to verbose buffer only, not text_buffer
+                # tool annotations go to the HTML buffer only, not text_buffer
     elif event_type == "result":
         permission_denials.extend(event.get("permission_denials") or [])
     return True
@@ -2060,6 +2137,7 @@ def stream_copilot(
     continue_session: bool,
     on_block,
     extra_allowed_tools: list[str] | None = None,
+    on_tool_use=None,
 ) -> tuple[bool, bool, str, list[dict], str]:
     """Run Claude/Copilot and stream output via on_block.
 
@@ -2111,16 +2189,17 @@ def stream_copilot(
     user_id = getattr(worker, "user_id", None)
     if user_id is None:
         terminate_process(process)
-        return False, False, "Worker metadata is missing for this request.", []
+        return False, False, "Worker metadata is missing for this request.", [], ""
     if not bind_active_request_process(user_id, process):
         terminate_process(process)
-        return False, False, "Request state was lost before Copilot started.", []
+        return False, False, "Request state was lost before Copilot started.", [], ""
     deadline = time.monotonic() + COPILOT_TIMEOUT
     buffer: list[str] = []
     text_buffer: list[str] = []
     sent_any = False
     last_flush = time.monotonic()
     permission_denials: list[dict] = []
+    tool_uses: dict[str, dict] = {}  # tool_use_id -> {input: ...} for enriching denials
     assert process.stdout is not None
 
     def flush_buffer() -> None:
@@ -2154,7 +2233,10 @@ def stream_copilot(
                 continue
 
             if AI_PROVIDER == "claude":
-                _parse_claude_stream_event(line, buffer, text_buffer, permission_denials)
+                _parse_claude_stream_event(
+                    line, buffer, text_buffer, permission_denials,
+                    tool_uses=tool_uses, on_tool_use=on_tool_use,
+                )
             else:
                 buffer.append(line)
                 text_buffer.append(line)
@@ -2177,6 +2259,11 @@ def stream_copilot(
 
     flush_buffer()
     text_content = "".join(text_buffer)
+    # Enrich permission_denials with actual tool input so buttons can show the real command.
+    for denial in permission_denials:
+        tool_id = denial.get("tool_use_id")
+        if tool_id and tool_id in tool_uses:
+            denial.setdefault("tool_input", tool_uses[tool_id].get("input", {}))
     active_request = get_active_request(user_id)
     if active_request is None or active_request.get("cancel_requested"):
         return False, sent_any, "Request was cancelled.", [], ""
@@ -2196,15 +2283,20 @@ def extract_prompt(text: str) -> tuple[str | None, bool]:
         normalized = normalize_command_token(command_token)
         if not normalized:
             return None, False
+        # Explicit provider commands: /claude <prompt> or /copilot <prompt>
         if normalized in {"/copilot", "/claude", f"/{AI_PROVIDER}"}:
             prompt = remainder.strip()
             return prompt or None, True
+        # Known bot commands are handled by handle_message, not forwarded to AI.
+        if normalized in BOT_COMMAND_NAMES:
+            return None, False
+        # Known provider slash aliases (e.g. /code_review → /code:review)
         provider_slash = PROVIDER_SLASH_ALIASES.get(normalized)
         if provider_slash:
             argument = remainder.strip()
-            prompt = f"{provider_slash} {argument}".strip()
-            return prompt, True
-        return None, False
+            return f"{provider_slash} {argument}".strip(), True
+        # Any other unknown /command → pass through to Claude transparently.
+        return stripped, True
     if BOT_USERNAME:
         stripped = re.sub(rf"(?i)@{re.escape(BOT_USERNAME)}\b[:,\-]?\s*", "", stripped).strip()
     if not stripped:
@@ -2289,13 +2381,85 @@ def _build_login_keyboard(user_id: int) -> list[list[dict]]:
     return [[{"text": "🔑 Login to Claude", "callback_data": f"login:{user_id}"}]]
 
 
+def _build_switch_to_agent_keyboard(user_id: int) -> list[list[dict]]:
+    return [[{"text": "🤖 Switch to Agent", "callback_data": f"to_agent:{user_id}"}]]
+
+
+def _build_switch_to_shell_keyboard(user_id: int) -> list[list[dict]]:
+    return [[{"text": "💻 Switch to Shell", "callback_data": f"to_shell:{user_id}"}]]
+
+
 def _build_permission_keyboard(user_id: int, denied_tools: list[dict]) -> list[list[dict]]:
-    names = sorted({d.get("tool_name", "") for d in denied_tools if d.get("tool_name")})
-    label = f"Allow {', '.join(names)} & retry" if names else "Allow all & retry"
-    return [
-        [{"text": f"✅ {label}", "callback_data": f"perm_allow:{user_id}"}],
-        [{"text": "❌ Skip (keep partial result)", "callback_data": f"perm_deny:{user_id}"}],
-    ]
+    buttons: list[list[dict]] = []
+    seen: set[str] = set()
+    for d in denied_tools:
+        name = d.get("tool_name", "")
+        inp = d.get("tool_input", {}) or {}
+        label = _tool_status_label(name, inp) if inp else (name or "tool")
+        short = label[:60]
+        if short in seen or len(buttons) >= 3:
+            continue
+        seen.add(short)
+        buttons.append([{"text": f"✅ Allow: {short}", "callback_data": f"perm_allow:{user_id}"}])
+    if not buttons:
+        buttons = [[{"text": "✅ Allow & retry", "callback_data": f"perm_allow:{user_id}"}]]
+    buttons.append([{"text": "❌ Deny & keep result", "callback_data": f"perm_deny:{user_id}"}])
+    return buttons
+
+
+def run_shell_command(chat_id: int, user_id: int, cmd_text: str) -> None:
+    """Execute a raw shell command and send the result to Telegram."""
+    cwd = get_cli_cwd(user_id)
+
+    # Handle `cd` specially — subprocess can't change the bot's working dir.
+    stripped_cmd = cmd_text.strip()
+    if re.match(r"^cd(\s|$)", stripped_cmd):
+        target = stripped_cmd[2:].strip() or str(Path.home())
+        target = os.path.expanduser(target)
+        new_path = os.path.realpath(os.path.join(cwd, target))
+        if os.path.isdir(new_path):
+            set_cli_cwd(user_id, new_path)
+            send_message_with_keyboard(
+                chat_id,
+                f"<code>$ {html.escape(stripped_cmd)}</code>\n📂 {html.escape(new_path)}",
+                _build_switch_to_agent_keyboard(user_id),
+                parse_mode="HTML",
+            )
+        else:
+            send_message(chat_id, f"cd: {html.escape(target)}: No such directory", parse_mode="HTML")
+        return
+
+    send_typing(chat_id)
+    try:
+        result = subprocess.run(
+            ["bash", "-c", stripped_cmd],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        stdout = (result.stdout or "").rstrip()
+        stderr = (result.stderr or "").rstrip()
+        output = stdout + ("\n" + stderr if stderr else "")
+        exit_icon = "✅" if result.returncode == 0 else "❌"
+        header = f"<code>$ {html.escape(stripped_cmd)}</code>"
+        footer = f"{exit_icon} exit {result.returncode}  <code>{html.escape(cwd)}</code>"
+        if output:
+            if len(output) > 3500:
+                output = output[:3497] + "…"
+            body = f"{header}\n\n<pre>{html.escape(output)}</pre>\n\n{footer}"
+        else:
+            body = f"{header}\n\n{footer}"
+        send_message_with_keyboard(
+            chat_id,
+            body,
+            _build_switch_to_agent_keyboard(user_id),
+            parse_mode="HTML",
+        )
+    except subprocess.TimeoutExpired:
+        send_message(chat_id, "❌ Command timed out (60 s)")
+    except Exception as error:
+        send_message(chat_id, f"❌ Error: {html.escape(str(error))}", parse_mode="HTML")
 
 
 def process_copilot_request(
@@ -2307,20 +2471,34 @@ def process_copilot_request(
     chat_id: int,
     extra_allowed_tools: list[str] | None = None,
 ) -> None:
-    request = start_active_request(user_id, chat_id, message, get_user_verbose_mode(state, user_id))
-    send_typing(chat_id)
-    send_message(chat_id, "Working...")
+    request = start_active_request(user_id, chat_id, message)
     worker = threading.current_thread()
     worker.user_id = user_id
+
+    # Live status message — edited in-place like the CLI spinner.
+    send_typing(chat_id)
+    status_msg_id = send_message(chat_id, "⏳ Thinking... 0s")
+    status_updater: _StatusUpdater | None = (
+        _StatusUpdater(chat_id, status_msg_id) if status_msg_id else None
+    )
 
     def on_block(block: str) -> None:
         debug_enabled, debug_chat_id = append_active_request_block(user_id, block)
         if debug_enabled and debug_chat_id is not None:
             send_text_blocks(debug_chat_id, block, parse_mode="HTML" if AI_PROVIDER == "claude" else None)
 
+    def on_tool_use(name: str, inp: dict) -> None:
+        if status_updater:
+            status_updater.set_label(_tool_status_label(name, inp))
+
     success, sent_any, result, permission_denials, text_content = stream_copilot(
-        prompt, continue_session, on_block, extra_allowed_tools
+        prompt, continue_session, on_block, extra_allowed_tools, on_tool_use=on_tool_use
     )
+
+    # Stop and delete the status message — content is now in the streamed blocks above.
+    if status_updater:
+        status_updater.stop()
+
     completed_request = finish_active_request(user_id) or request
     raw_text = "\n\n".join(completed_request.get("raw_blocks") or [])
     if raw_text:
@@ -2330,25 +2508,12 @@ def process_copilot_request(
         session_state = get_session_state(state, user_id)
         session_state["has_session"] = True
         save_state(state)
-        verbose_mode = completed_request.get("debug_enabled", False)
-        if verbose_mode:
-            # Content was already streamed live; don't re-send as summary.
-            if not sent_any:
-                send_message(chat_id, "Task finished.")
-        else:
-            summary_text = build_user_facing_text(text_content)
-            if summary_text:
-                if AI_PROVIDER == "claude":
-                    send_text_blocks(chat_id, markdown_to_telegram_html(summary_text), parse_mode="HTML")
-                else:
-                    send_text_blocks(chat_id, summary_text)
-            elif not sent_any:
-                send_message(chat_id, "Task finished.")
+        # Content was streamed live; only send a fallback if nothing was output.
+        if not sent_any:
+            send_message(chat_id, "✅ Done.")
 
         if permission_denials:
-            # Task succeeded but some tools were blocked — offer retry with those tools allowed.
             tool_names = sorted({d.get("tool_name", "") for d in permission_denials if d.get("tool_name")})
-            denied_summary = ", ".join(f"`{n}`" for n in tool_names) if tool_names else "some tools"
             set_pending_permission(user_id, {
                 "prompt": prompt,
                 "continue_session": continue_session,
@@ -2358,38 +2523,43 @@ def process_copilot_request(
                 "allowed_tools": [f"{n}(*)" for n in tool_names] if tool_names else [],
             })
             keyboard = _build_permission_keyboard(user_id, permission_denials)
+            denied_labels = [
+                _tool_status_label(d.get("tool_name", ""), d.get("tool_input", {}) or {})
+                for d in permission_denials[:3]
+            ]
             send_message_with_keyboard(
                 chat_id,
-                f"Claude was blocked from using {denied_summary}. "
-                "Allow those tools and retry the same request?",
+                "🚫 Blocked:\n" + "\n".join(f"• {l}" for l in denied_labels) + "\n\nAllow and retry?",
                 keyboard,
             )
         else:
             send_group_done_ack(chat_id, message)
-        return
+    else:
+        session_state = get_session_state(state, user_id)
+        session_state["has_session"] = False
+        save_state(state)
 
-    session_state = get_session_state(state, user_id)
-    session_state["has_session"] = False
-    save_state(state)
+        if completed_request.get("cancel_requested") or result == "Request was cancelled.":
+            send_message(chat_id, f"⛔ Cancelled. {provider_name()} session reset.")
+            send_group_done_ack(chat_id, message)
+        elif result:
+            all_output = text_content or raw_text
+            if is_credits_limit_error(all_output) or is_credits_limit_error(result):
+                send_message_with_keyboard(
+                    chat_id,
+                    "⚠️ Claude hit a usage or session limit. Log in to continue.",
+                    _build_login_keyboard(user_id),
+                )
+            else:
+                send_message(chat_id, "❌ Task failed. Use /debug for details.")
+                if result and result not in ("Request was cancelled.",):
+                    send_text_blocks(chat_id, result)
+            send_group_done_ack(chat_id, message)
 
-    if completed_request.get("cancel_requested") or result == "Request was cancelled.":
-        send_message(chat_id, f"Cancelled the active request and reset your {provider_name()} session. You can start a new one now.")
-        send_group_done_ack(chat_id, message)
-        return
-
-    if result:
-        all_output = text_content or raw_text
-        if is_credits_limit_error(all_output) or is_credits_limit_error(result):
-            send_message_with_keyboard(
-                chat_id,
-                "Claude hit a usage or session limit. Log in to continue (you can switch accounts).",
-                _build_login_keyboard(user_id),
-            )
-        else:
-            send_message(chat_id, "The task failed. Use /debug to see the technical details.")
-            if completed_request.get("debug_enabled"):
-                send_text_blocks(chat_id, result)
-    send_group_done_ack(chat_id, message)
+    # Process any messages that arrived while we were busy.
+    next_msg = pop_queued_message(user_id)
+    if next_msg:
+        handle_message(next_msg, state)
 
 
 def handle_callback_query(query: dict, state: dict) -> None:
@@ -2415,11 +2585,11 @@ def handle_callback_query(query: dict, state: dict) -> None:
             send_message(chat_id, "This permission request has already been handled or has expired.")
             return
         if get_active_request(user_id):
-            send_message(chat_id, busy_lock_text())
+            send_message(chat_id, "⏳ Still busy. Try again after the current task finishes.")
             return
         tool_names = sorted({d.get("tool_name", "") for d in (pending.get("denied_tools") or []) if d.get("tool_name")})
         label = ", ".join(tool_names) if tool_names else "requested tools"
-        send_message(chat_id, f"Allowed {label}. Retrying...")
+        send_message(chat_id, f"✅ Allowed {label}. Retrying...")
         allowed_tools = pending.get("allowed_tools") or []
         worker = threading.Thread(
             target=process_copilot_request,
@@ -2444,9 +2614,22 @@ def handle_callback_query(query: dict, state: dict) -> None:
 
     elif data == f"login:{user_id}":
         if message_id:
-            edit_message_reply_markup(chat_id, message_id)  # remove buttons immediately
+            edit_message_reply_markup(chat_id, message_id)
         fake_message = {"chat": {"id": chat_id, "type": "private"}, "from": {"id": user_id}, "message_id": 0}
         handle_login_command(fake_message)
+
+    elif data == f"to_agent:{user_id}":
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id)
+        set_user_cli_mode(user_id, False)
+        send_message(chat_id, "🤖 Switched to Agent mode. Send a prompt to Claude.")
+
+    elif data == f"to_shell:{user_id}":
+        if message_id:
+            edit_message_reply_markup(chat_id, message_id)
+        set_user_cli_mode(user_id, True)
+        cwd = get_cli_cwd(user_id)
+        send_message(chat_id, f"💻 Switched to Shell mode.\n<code>{html.escape(cwd)}</code>", parse_mode="HTML")
 
 
 def handle_message(message: dict, state: dict) -> None:
@@ -2515,64 +2698,47 @@ def handle_message(message: dict, state: dict) -> None:
     if command == "/debug":
         handle_debug_command(message, state)
         return
-    if command == "/verbose":
-        argument = parse_command_argument(get_message_text(message)).strip().lower()
-        if not argument:
-            send_message(chat_id, verbose_mode_status_text(state, user_id))
-            send_group_done_ack(chat_id, message)
-            return
-
-        if argument in {"on", "true", "1", "yes"}:
-            set_user_verbose_override(state, user_id, True)
-            send_message(chat_id, "Verbose mode is now ON for your new requests.")
-            send_group_done_ack(chat_id, message)
-            return
-
-        if argument in {"off", "false", "0", "no"}:
-            set_user_verbose_override(state, user_id, False)
-            send_message(chat_id, "Verbose mode is now OFF for your new requests.")
-            send_group_done_ack(chat_id, message)
-            return
-
-        if argument == "toggle":
-            current = get_user_verbose_mode(state, user_id)
-            set_user_verbose_override(state, user_id, not current)
-            send_message(chat_id, f"Verbose mode is now {'ON' if not current else 'OFF'} for your new requests.")
-            send_group_done_ack(chat_id, message)
-            return
-
-        if argument == "default":
-            set_user_verbose_override(state, user_id, None)
-            send_message(
-                chat_id,
-                (
-                    "Verbose mode reset to the global default "
-                    f"({'ON' if DEFAULT_VERBOSE else 'OFF'})."
-                ),
-            )
-            send_group_done_ack(chat_id, message)
-            return
-
-        send_message(chat_id, "Unknown value. Use /verbose on, /verbose off, /verbose toggle, or /verbose default.")
+    if command in {"/shell", "/cli"}:
+        set_user_cli_mode(user_id, True)
+        cwd = get_cli_cwd(user_id)
+        send_message_with_keyboard(
+            chat_id,
+            f"💻 Shell mode. Type commands directly.\n<code>{html.escape(cwd)}</code>",
+            _build_switch_to_agent_keyboard(user_id),
+            parse_mode="HTML",
+        )
+        send_group_done_ack(chat_id, message)
+        return
+    if command in {"/agent", "/claude", "/copilot"}:
+        set_user_cli_mode(user_id, False)
+        send_message_with_keyboard(
+            chat_id,
+            "🤖 Agent mode. Send a prompt to Claude.",
+            _build_switch_to_shell_keyboard(user_id),
+        )
         send_group_done_ack(chat_id, message)
         return
     if command == "/cancel":
+        cleared = clear_queued_messages(user_id)
         active_request = get_active_request(user_id)
         if active_request:
             cancel_active_request(user_id)
-            send_message(chat_id, "Stopping the active request. I will reset your session as soon as the worker exits.")
+            extra = f" ({cleared} queued message(s) also cleared)" if cleared else ""
+            send_message(chat_id, f"⛔ Stopping the active request.{extra} Session will reset.")
             return
-        send_message(chat_id, "There is no pending upload or active request to cancel.")
+        if cleared:
+            send_message(chat_id, f"Cleared {cleared} queued message(s).")
+            send_group_done_ack(chat_id, message)
+            return
+        send_message(chat_id, "Nothing to cancel.")
         send_group_done_ack(chat_id, message)
         return
     if command == "/new":
-        if get_active_request(user_id):
-            send_message(chat_id, busy_lock_text())
-            return
+        clear_queued_messages(user_id)
         session_state["has_session"] = False
         clear_pending_permission(user_id)
         save_state(state)
-        send_message(chat_id, f"Started a fresh {provider_name()} thread for your account.")
+        send_message(chat_id, f"🔄 Fresh {provider_name()} session started.")
         send_group_done_ack(chat_id, message)
         return
     if command == "/status":
@@ -2598,8 +2764,21 @@ def handle_message(message: dict, state: dict) -> None:
         send_group_done_ack(chat_id, message)
         return
 
+    # ---- Shell (CLI) mode: forward text as raw bash commands ----
+    if get_user_cli_mode(user_id) and text and not command:
+        if get_active_request(user_id):
+            send_message(chat_id, "⏳ Still running — wait or /cancel")
+            return
+        threading.Thread(
+            target=run_shell_command, args=(chat_id, user_id, text), daemon=True
+        ).start()
+        return
+
+    # ---- Agent mode ----
     if get_active_request(user_id):
-        send_message(chat_id, busy_lock_text())
+        queue_user_message(user_id, message)
+        queued_count = len(QUEUED_MESSAGES.get(user_id, []))
+        send_message(chat_id, f"📥 Queued (position {queued_count}). Will run after current task.")
         return
 
     attachment_paths: list[Path] = []
